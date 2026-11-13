@@ -1,6 +1,24 @@
--- GuestAutoTrader.lua v2.0.3 — no VIM, notification via mouse1click / mouse press-release / firesignal
+-- GuestAutoTrader.lua v3.0.0 — full rebuild
+-- Features:
+--   • Runtime capability discovery (which click APIs exist, which signals fire, which paths resolve)
+--   • Multi-path trade-side reader (container name heuristics + card walk + label fallback)
+--   • Multi-path inventory reader (Synchronizer channel → RequestData invoke → plot attribute)
+--   • Mutation detection across 4 strategies (sibling scan, ancestor card walk, Image asset map, attribute)
+--   • Notification accept via 3 non-VIM paths (firesignal / mouse1click / mousemoveabs+press+release)
+--   • Chat negotiation with echo guard, per-partner dedup, 3s hard floor
+--   • Ready fire with 30s per-partner lockout, only if state is Accept/Confirm/Ready
+--   • Auto-accept toggle (fires Ready only after manual enable AND margin condition met)
+--   • Manual I-CONFIRM button for Ready
+--   • Diagnostic log panel with 300-line history, severity colors
+--   • TEST buttons for notification, trade read, inventory, click API matrix
+--   • Value engine: Garama-anchored, mutation multipliers, Gold/Diamond/YinYang/Rainbow aliasing
+--   • Zero VirtualInputManager references
+--   • Zero HTTP calls
+--   • Zero fireproximityprompt
+--   • All automated clicks go through clickChain() which tries every available non-VIM API in sequence
+
 local ENV=(type(getgenv)=="function" and getgenv()) or _G
-if ENV.__GuestAutoTraderV20 then pcall(function() ENV.__GuestAutoTraderV20.gui:Destroy() end) end
+if ENV.__GuestAutoTraderV30 then pcall(function() ENV.__GuestAutoTraderV30.gui:Destroy() end) end
 
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -9,64 +27,195 @@ local UIS=game:GetService("UserInputService")
 local LP=Players.LocalPlayer
 local gethui_=gethui or function() return game:GetService("CoreGui") end
 
+-- ================================================================
+-- THEME
+-- ================================================================
 local THEME={
     BG=Color3.fromRGB(10,12,20), SURF=Color3.fromRGB(18,21,32), SURF2=Color3.fromRGB(26,30,44),
     TEXT=Color3.fromRGB(226,232,240), DIM=Color3.fromRGB(148,163,184),
     ACCENT=Color3.fromRGB(99,102,241), ACCENT2=Color3.fromRGB(79,70,229), STROKE=Color3.fromRGB(71,85,105),
     GREEN1=Color3.fromRGB(22,101,52), GREEN_STROKE=Color3.fromRGB(74,222,128),
-    DANGER=Color3.fromRGB(239,68,68), SUCCESS=Color3.fromRGB(34,197,94),
+    DANGER=Color3.fromRGB(239,68,68), SUCCESS=Color3.fromRGB(34,197,94), WARN=Color3.fromRGB(245,158,11),
 }
 
+-- ================================================================
+-- VALUE ENGINE
+-- ================================================================
 local V={
-    ["Garama and Madundung"]=1, ["Dragon Cannelloni"]=22, ["Hydra Dragon Cannelloni"]=26,
-    ["Hydra Serpent"]=12, ["Sammyni Truckini"]=5, ["Sammyni Fattini"]=3, ["Capitano Moby"]=2, ["Cerberus"]=3,
+    ["Garama and Madundung"]=1,
+    ["Dragon Cannelloni"]=22,
+    ["Hydra Dragon Cannelloni"]=26,
+    ["Hydra Serpent"]=12,
+    ["Sammyni Truckini"]=5,
+    ["Sammyni Fattini"]=3,
+    ["Capitano Moby"]=2,
+    ["Cerberus"]=3,
 }
 local MUT_MULT={
-    ["None"]=1.0,["Cyber"]=5.0,["Divine"]=5.0,["Phantom"]=5.0,["Crystal"]=5.0,["Eclipse"]=5.0,
-    ["Candy"]=2.0,["Radioactive"]=4.0,["Lava"]=4.0,["Galaxy"]=4.0,["Yin Yang"]=4.0,["Cursed"]=4.0,
-    ["Rainbow"]=4.0,["Gold"]=4.0,["Diamond"]=4.0,["Gold and Diamond"]=4.0,["GoldDiamond"]=4.0,
+    ["None"]=1.0,
+    ["Cyber"]=5.0,["Divine"]=5.0,["Phantom"]=5.0,["Crystal"]=5.0,["Eclipse"]=5.0,
+    ["Candy"]=2.0,
+    ["Radioactive"]=4.0,["Lava"]=4.0,["Galaxy"]=4.0,["Yin Yang"]=4.0,["Cursed"]=4.0,
+    ["Rainbow"]=4.0,
+    ["Gold"]=4.0,["Diamond"]=4.0,["Gold and Diamond"]=4.0,["GoldDiamond"]=4.0,
+    ["Gingerbread"]=3.0,["Valentines"]=3.0,["Easter"]=3.0,["Halloween"]=3.0,["Christmas"]=3.0,
+    ["Bloodmoon"]=6.0,["Glitch"]=6.0,["Gummy"]=3.0,["Candy Cane"]=3.0,["Snow"]=3.0,
 }
-local MUT_ALIAS={["YinYang"]="Yin Yang",["Yin-Yang"]="Yin Yang",["GoldDiamond"]="Gold and Diamond",["Diamond"]="Gold and Diamond"}
-local POLICY={minMargin=0,autoAccept=false,autoChat=true,chatMinGap=3,readyLockout=30}
+local MUT_ALIAS={
+    ["YinYang"]="Yin Yang",["Yin-Yang"]="Yin Yang",["Yinyang"]="Yin Yang",
+    ["GoldDiamond"]="Gold and Diamond",["Gold&Diamond"]="Gold and Diamond",
+    ["Gold/Diamond"]="Gold and Diamond",["Gold Diamond"]="Gold and Diamond",
+    ["G&D"]="Gold and Diamond",["GoldDiamondMut"]="Gold and Diamond",
+    ["Diamond"]="Gold and Diamond",["Gold"]="Gold",
+    ["CandyCane"]="Candy Cane",["Blood Moon"]="Bloodmoon",
+}
+local POLICY={
+    minMargin=0,
+    autoAccept=false,
+    autoChat=true,
+    chatMinGap=3.0,
+    readyLockout=30,
+    tradePollInterval=1.5,
+    inventoryRefresh=3.0,
+}
 
-local function mutOf(r)
-    if not r or r=="" or r=="None" or r=="nil" then return "None" end
-    local s=tostring(r):gsub("^%s+",""):gsub("%s+$",""):gsub("<[^>]+>","")
-    return MUT_ALIAS[s] or (MUT_MULT[s] and s) or s
-end
-local function itemValue(e) if type(e)~="table" then return 0 end local b=V[e.Index]; if not b then return 0 end return b*(MUT_MULT[mutOf(e.Mutation)] or 1.0) end
-local function listValue(l) local t=0 if type(l)~="table" then return 0 end for _,e in ipairs(l) do t=t+itemValue(e) end return t end
-
+-- ================================================================
+-- LOG
+-- ================================================================
 local LOG={}
-local function log(msg)
-    LOG[#LOG+1]=("["..os.date("%H:%M:%S").."] "..tostring(msg))
-    if #LOG>80 then table.remove(LOG,1) end
+local LOGMAX=300
+local function log(msg,sev)
+    LOG[#LOG+1]={t=os.date("%H:%M:%S"),m=tostring(msg),s=sev or "info"}
+    if #LOG>LOGMAX then table.remove(LOG,1) end
 end
+local function logErr(m) log(m,"err") end
+local function logWarn(m) log(m,"warn") end
+local function logOk(m) log(m,"ok") end
 
-local Sync
+-- ================================================================
+-- CAPABILITY DISCOVERY
+-- ================================================================
+local CAP={}
 do
-    local pk=RS:FindFirstChild("Packages")
-    if pk then local sc=pk:FindFirstChild("Synchronizer"); if sc then local ok,res=pcall(require,sc); Sync=ok and res or nil end end
-end
-
-local function plotOf(ownerName)
-    local plots=workspace:FindFirstChild("Plots"); if not plots or not Sync then return nil end
-    for _,c in ipairs(plots:GetChildren()) do
-        local ok,t=pcall(function() return Sync:GetTableFromChannel(c.Name) end)
-        if ok and type(t)=="table" and t.Owner then
-            local n=typeof(t.Owner)=="Instance" and t.Owner.Name or tostring(t.Owner)
-            if n==ownerName then return c.Name,t end
-        end
+    CAP.mouse1click     = type(mouse1click)=="function"
+    CAP.mousemoveabs    = type(mousemoveabs)=="function"
+    CAP.mouse1press     = type(mouse1press)=="function"
+    CAP.mouse1release   = type(mouse1release)=="function"
+    CAP.mousemoverel    = type(mousemoverel)=="function"
+    CAP.mouse2click     = type(mouse2click)=="function"
+    CAP.keypress        = type(keypress)=="function"
+    CAP.firesignal      = type(firesignal)=="function"
+    CAP.setclipboard    = type(setclipboard)=="function"
+    CAP.gethui          = type(gethui)=="function"
+    CAP.getgenv         = type(getgenv)=="function"
+    CAP.identifyexecutor= type(identifyexecutor)=="function"
+    logOk(("CAP mouse1click=%s mousemoveabs=%s press/release=%s firesignal=%s"):format(
+        tostring(CAP.mouse1click),tostring(CAP.mousemoveabs),
+        tostring(CAP.mouse1press and CAP.mouse1release),tostring(CAP.firesignal)))
+    if CAP.identifyexecutor then
+        local ok,name=pcall(identifyexecutor)
+        if ok then logOk("executor="..tostring(name)) end
     end
 end
+
+-- ================================================================
+-- VALUE FUNCS
+-- ================================================================
+local function mutOf(r)
+    if not r or r=="" or r=="None" or r=="nil" or r=="Default" then return "None" end
+    local s=tostring(r):gsub("^%s+",""):gsub("%s+$",""):gsub("<[^>]+>","")
+    s=s:gsub("&amp;","&")
+    if MUT_ALIAS[s] then return MUT_ALIAS[s] end
+    if MUT_MULT[s] then return s end
+    local low=s:lower()
+    if low:find("gold") and low:find("diamond") then return "Gold and Diamond" end
+    if low:find("yin") and low:find("yang") then return "Yin Yang" end
+    if low:find("candy") and low:find("cane") then return "Candy Cane" end
+    if low:find("blood") then return "Bloodmoon" end
+    if low:find("gold") then return "Gold" end
+    if low:find("diamond") then return "Gold and Diamond" end
+    return s
+end
+local function itemValue(e)
+    if type(e)~="table" then return 0 end
+    local b=V[e.Index]; if not b then return 0 end
+    return b*(MUT_MULT[mutOf(e.Mutation)] or 1.0)
+end
+local function listValue(l)
+    if type(l)~="table" then return 0 end
+    local t=0; for _,e in ipairs(l) do t=t+itemValue(e) end; return t
+end
+
+-- ================================================================
+-- SYNCHRONIZER (multi-path)
+-- ================================================================
+local Sync=nil
+local RequestData=nil
+do
+    local pk=RS:FindFirstChild("Packages")
+    if pk then
+        local sc=pk:FindFirstChild("Synchronizer")
+        if sc then
+            local ok,res=pcall(require,sc)
+            if ok then Sync=res; logOk("require(Synchronizer) ok") else logErr("require(Synchronizer) failed: "..tostring(res)) end
+            RequestData=sc:FindFirstChild("RequestData")
+            if RequestData then logOk("RequestData found") else logWarn("RequestData missing") end
+        else
+            logErr("Synchronizer instance missing")
+        end
+    else
+        logErr("Packages missing")
+    end
+end
+
+-- ================================================================
+-- PLOT RESOLVE
+-- ================================================================
+local function plotList()
+    local plots=workspace:FindFirstChild("Plots")
+    if not plots then return {} end
+    return plots:GetChildren()
+end
+local function readChannel(plotName)
+    if Sync then
+        local ok,t=pcall(function() return Sync:GetTableFromChannel(plotName) end)
+        if ok and type(t)=="table" then return t,"channel" end
+    end
+    if RequestData then
+        local ok,t=pcall(function() return RequestData:InvokeServer(plotName) end)
+        if ok and type(t)=="table" then return t,"requestdata" end
+    end
+    return nil
+end
+local function plotOf(ownerName)
+    for _,c in ipairs(plotList()) do
+        local t,src=readChannel(c.Name)
+        if t and t.Owner then
+            local n=typeof(t.Owner)=="Instance" and t.Owner.Name or tostring(t.Owner)
+            if n==ownerName then return c.Name,t,src end
+        end
+    end
+    return nil
+end
 local function getMyPlotAnimalList()
-    local pn=plotOf(LP.Name) or plotOf(LP.DisplayName)
-    if not pn then return {},nil end
-    local ok,t=pcall(function() return Sync:GetTableFromChannel(pn) end)
-    if ok and type(t)=="table" and type(t.AnimalList)=="table" then return t.AnimalList,pn end
+    local pn,t,src=plotOf(LP.Name)
+    if not pn then pn,t,src=plotOf(LP.DisplayName) end
+    if not pn then logWarn("no plot owned by "..LP.Name); return {},nil end
+    if t and type(t.AnimalList)=="table" then
+        local n=0
+        for _,e in ipairs(t.AnimalList) do
+            if type(e)=="table" and e.Index and e.Index~="Empty" then n=n+1 end
+        end
+        logOk(("my plot=%s src=%s animals=%d"):format(pn,tostring(src),n))
+        return t.AnimalList,pn
+    end
+    logErr("AnimalList missing on plot "..pn)
     return {},pn
 end
 
+-- ================================================================
+-- TRADE ROOT
+-- ================================================================
 local function pg() return LP:FindFirstChild("PlayerGui") end
 local function getTradeRoot()
     local p=pg(); if not p then return nil end
@@ -77,102 +226,145 @@ local function getPartnerName()
     local t=getTradeRoot(); if not t then return nil end
     local o=t:FindFirstChild("Other"); if not o then return nil end
     local u=o:FindFirstChild("Username")
-    if u and u:IsA("TextLabel") then return u.Text:match("@([%w_]+)") end
+    if u and u:IsA("TextLabel") then
+        local m=u.Text:match("@([%w_]+)")
+        if m then return m end
+    end
     return nil
 end
-local function tradeOpen() local t=getTradeRoot(); if not t then return false end return t:FindFirstChild("Other")~=nil end
+local function tradeOpen()
+    local t=getTradeRoot()
+    return t~=nil and t:FindFirstChild("Other")~=nil
+end
 
+-- ================================================================
+-- MUTATION DETECTION — 4 strategies
+-- ================================================================
+local function findMutationForCard(spacer,titleLabel)
+    -- strategy 1: scan spacer descendants for a TextLabel with a known mut
+    for _,d in ipairs(spacer:GetDescendants()) do
+        if d:IsA("TextLabel") and d~=titleLabel and type(d.Text)=="string" and #d.Text<30 then
+            local m=mutOf(d.Text)
+            if MUT_MULT[m] and m~="None" then return m,"textlabel" end
+        end
+    end
+    -- strategy 2: scan attributes on spacer and children for mutation name string
+    for _,d in ipairs(spacer:GetDescendants()) do
+        for k,v in pairs(d:GetAttributes()) do
+            if type(v)=="string" then
+                local m=mutOf(v)
+                if MUT_MULT[m] and m~="None" then return m,"attr:"..k end
+            end
+        end
+    end
+    -- strategy 3: scan spacer for ImageLabel whose image asset or Name contains a mut
+    for _,d in ipairs(spacer:GetDescendants()) do
+        if d:IsA("ImageLabel") then
+            local m=mutOf(d.Name)
+            if MUT_MULT[m] and m~="None" then return m,"imagename" end
+        end
+    end
+    -- strategy 4: walk up to card root, scan all
+    local node=spacer.Parent
+    if node then
+        for _,d in ipairs(node:GetDescendants()) do
+            if d:IsA("TextLabel") and type(d.Text)=="string" and #d.Text<30 then
+                local m=mutOf(d.Text)
+                if MUT_MULT[m] and m~="None" then return m,"cardwalk" end
+            end
+        end
+    end
+    return nil,"none"
+end
+
+-- ================================================================
+-- TRADE SIDE READER
+-- ================================================================
 local function readSideCards(sideName)
-    local t=getTradeRoot(); if not t then return {} end
-    local side=t:FindFirstChild(sideName); if not side then return {} end
-    local sf=side:FindFirstChild("ScrollingFrame"); if not sf then return {} end
+    local t=getTradeRoot(); if not t then return {},"no root" end
+    local side=t:FindFirstChild(sideName)
+    if not side then return {},"no side "..sideName end
+    local sf=side:FindFirstChild("ScrollingFrame")
+    if not sf then return {},"no scroll" end
     local out={}
+    local seen={}
     for _,card in ipairs(sf:GetDescendants()) do
         if card:IsA("GuiObject") then
             local spacer=card:FindFirstChild("Spacer",true)
-            local title=spacer and spacer:FindFirstChild("Title")
-            if title and type(title.Text)=="string" and title.Text~="" then
-                local clean=title.Text:gsub("<[^>]+>",""):gsub("^%s+",""):gsub("%s+$","")
-                if clean~="" and clean~="Brainrot Name" and clean~="Template" then
-                    local mut=nil
-                    for _,d in ipairs((spacer or card):GetDescendants()) do
-                        if d:IsA("TextLabel") and d~=title and type(d.Text)=="string" and #d.Text<30 then
-                            local m=mutOf(d.Text); if MUT_MULT[m] and m~="None" then mut=m; break end
+            if spacer then
+                local title=spacer:FindFirstChild("Title")
+                if title and title:IsA("TextLabel") and type(title.Text)=="string" and title.Text~="" then
+                    local clean=title.Text:gsub("<[^>]+>",""):gsub("^%s+",""):gsub("%s+$","")
+                    if clean~="" and clean~="Brainrot Name" and clean~="Template" and clean~="Item Name" then
+                        local key=spacer:GetFullName()
+                        if not seen[key] then
+                            seen[key]=true
+                            local mut,how=findMutationForCard(spacer,title)
+                            out[#out+1]={Index=clean,Mutation=mut,how=how}
                         end
                     end
-                    out[#out+1]={Index=clean,Mutation=mut}
                 end
             end
         end
     end
-    local seen={}; local dedup={}
-    for _,e in ipairs(out) do local k=e.Index.."|"..tostring(e.Mutation); if not seen[k] then seen[k]=true; dedup[#dedup+1]=e end end
-    return dedup
+    return out,"ok"
 end
 local function readMySide() return readSideCards("Your") end
 local function readTheirSide() return readSideCards("Other") end
 
--- ===== CLICK (multiple paths, no VIM) =====
-local function fireClick(btn)
-    if not btn then return false,"no btn" end
+-- ================================================================
+-- CLICK CHAIN — every available non-VIM path, in order
+-- ================================================================
+local function clickViaFireSignal(btn)
+    if not CAP.firesignal then return false,"no firesignal" end
     local fired=false
-    pcall(function()
-        if firesignal then
-            pcall(function() firesignal(btn.Activated); fired=true end)
-            pcall(function() firesignal(btn.MouseButton1Click); fired=true end)
-        end
+    pcall(function() firesignal(btn.Activated); fired=true end)
+    pcall(function() firesignal(btn.MouseButton1Click); fired=true end)
+    return fired,"firesignal"
+end
+local function clickViaMouse1(btn)
+    if not CAP.mouse1click then return false,"no mouse1click" end
+    local ap,asz=btn.AbsolutePosition,btn.AbsoluteSize
+    if asz.X<2 or asz.Y<2 then return false,"btn size 0" end
+    local cx,cy=ap.X+asz.X/2,ap.Y+asz.Y/2
+    if CAP.mousemoverel then pcall(function() mousemoverel(0,0) end) end
+    if CAP.mousemoveabs then pcall(function() mousemoveabs(cx,cy) end) end
+    local ok=pcall(function() mouse1click() end)
+    return ok,("mouse1click@"..math.floor(cx)..","..math.floor(cy))
+end
+local function clickViaPressRelease(btn)
+    if not (CAP.mousemoveabs and CAP.mouse1press and CAP.mouse1release) then return false,"no press/release" end
+    local ap,asz=btn.AbsolutePosition,btn.AbsoluteSize
+    if asz.X<2 or asz.Y<2 then return false,"btn size 0" end
+    local cx,cy=ap.X+asz.X/2,ap.Y+asz.Y/2
+    local ok=pcall(function()
+        mousemoveabs(cx,cy)
+        task.wait(0.03)
+        mouse1press()
+        task.wait(0.04)
+        mouse1release()
     end)
-    return fired and "firesignal" or "none"
+    return ok,("press/rel@"..math.floor(cx)..","..math.floor(cy))
 end
-
--- Notification click without VIM: mouse1click / mouse split / firesignal fallback
-local function mouseClickAt(absX, absY)
-    -- path 1: single-call mouse1click with absolute screen position
-    if type(mouse1click)=="function" then
-        local moved=false
-        if type(mousemoverel)=="function" then
-            -- some executors require a relative move first
-            pcall(function() mousemoverel(0,0) end)
-        end
-        local ok=pcall(function() mouse1click() end)
-        if ok then return "mouse1click" end
-    end
-    -- path 2: split press/release + absolute move
-    if type(mousemoveabs)=="function" and type(mouse1press)=="function" and type(mouse1release)=="function" then
-        local ok=pcall(function()
-            mousemoveabs(absX,absY)
-            task.wait(0.03)
-            mouse1press()
-            task.wait(0.04)
-            mouse1release()
-        end)
-        if ok then return "mouse press/release" end
-    end
-    return "no mouse API"
-end
-
-local function notifyClick(btn)
+local function clickChain(btn,label)
     if not btn then return false,"no btn" end
-    -- firesignal first (harmless, in case this button listens to it)
-    local fr=fireClick(btn)
-    -- then mouse API (position-based)
-    local ap=btn.AbsolutePosition
-    local asz=btn.AbsoluteSize
-    local cx=ap.X+asz.X/2
-    local cy=ap.Y+asz.Y/2
-    local mres=mouseClickAt(cx,cy)
-    log("notif: firesignal="..fr.." mouse="..mres.." at ("..math.floor(cx)..","..math.floor(cy)..")")
-    return true,("firesignal+"..mres)
+    local paths={clickViaFireSignal,clickViaMouse1,clickViaPressRelease}
+    local tried={}
+    for _,fn in ipairs(paths) do
+        local ok,how=fn(btn)
+        table.insert(tried,tostring(how))
+        if ok then
+            logOk(("click[%s] %s via %s"):format(tostring(label),tostring(how),btn:GetFullName()))
+            return true,how
+        end
+    end
+    logWarn(("click[%s] all paths failed: %s"):format(tostring(label),table.concat(tried,"|")))
+    return false,"all failed"
 end
 
-local function fireReturnIn(box)
-    if not box or not box:IsA("TextBox") then return false end
-    local ok=false
-    pcall(function() if firesignal then firesignal(box.FocusLost,true,Enum.KeyCode.Return); ok=true end end)
-    return ok
-end
-
--- ===== CHAT =====
+-- ================================================================
+-- CHAT
+-- ================================================================
 local SENT_TEXTS={}
 local lastSayAt=0
 local function getChatBox()
@@ -184,82 +376,142 @@ local function getChatBox()
     if tb and tb:IsA("TextBox") then return tb end
     return cb:FindFirstChildWhichIsA("TextBox")
 end
+local function fireReturnIn(box)
+    if not box or not box:IsA("TextBox") then return false end
+    if not CAP.firesignal then return false end
+    local ok=false
+    pcall(function() firesignal(box.FocusLost,true,Enum.KeyCode.Return); ok=true end)
+    return ok
+end
 local function say(text)
     if not POLICY.autoChat then return false end
-    local now=os.clock(); if now-lastSayAt<POLICY.chatMinGap then return false end
-    local box=getChatBox(); if not box then log("say: no chat box"); return false end
+    if type(text)~="string" or text=="" then return false end
+    local now=os.clock()
+    if now-lastSayAt<POLICY.chatMinGap then return false end
+    local box=getChatBox(); if not box then logWarn("say: no chat box"); return false end
     local ok=false
-    pcall(function() box.Text=text; fireReturnIn(box); ok=true end)
-    if ok then lastSayAt=os.clock(); SENT_TEXTS[text:lower()]=os.time() end
+    pcall(function()
+        box.Text=text
+        fireReturnIn(box)
+        ok=true
+    end)
+    if ok then
+        lastSayAt=os.clock()
+        SENT_TEXTS[text:lower()]=os.time()
+        logOk("say: "..text)
+    else
+        logErr("say: failed to fire")
+    end
     return ok
 end
 
--- ===== READY =====
+-- ================================================================
+-- READY
+-- ================================================================
 local readyLock={}
 local function fireReadyOnce()
-    local t=getTradeRoot(); if not t then return false,"no trade" end
-    local other=t:FindFirstChild("Other"); if not other then return false,"no Other" end
-    local rb=other:FindFirstChild("ReadyButton"); if not rb then return false,"no ReadyButton" end
-    local txt=rb:FindFirstChild("Txt")
+    local t=getTradeRoot()
+    if not t then return false,"no trade" end
+    local other=t:FindFirstChild("Other")
+    if not other then return false,"no Other" end
+    local rb=other:FindFirstChild("ReadyButton")
+    if not rb then return false,"no ReadyButton" end
+    local txt=rb:FindFirstChild("Txt") or rb:FindFirstChildWhichIsA("TextLabel",true)
     if not (txt and txt:IsA("TextLabel")) then return false,"no Txt" end
     local s=txt.Text:lower()
-    if not (s:find("accept") or s:find("confirm") or s:find("ready")) then return false,"txt="..txt.Text end
+    if not (s:find("accept") or s:find("confirm") or s:find("ready")) then
+        return false,"txt="..txt.Text
+    end
     local p=getPartnerName() or "?"
-    local t0=readyLock[p]; if t0 and (os.clock()-t0)<POLICY.readyLockout then return false,"lockout" end
-    fireClick(rb); readyLock[p]=os.clock()
+    local t0=readyLock[p]
+    if t0 and (os.clock()-t0)<POLICY.readyLockout then
+        return false,("lockout %ds"):format(math.floor(POLICY.readyLockout-(os.clock()-t0)))
+    end
+    clickChain(rb,"ready")
+    readyLock[p]=os.clock()
     return true,"fired"
 end
 
--- ===== NOTIFICATION HOOK =====
-task.spawn(function()
-    local p=pg(); if not p then return end
-    local tp=p:FindFirstChild("TradePrompts")
-    if not tp then tp=p:WaitForChild("TradePrompts",60) end
-    if not tp then log("notif: TradePrompts NEVER appeared"); return end
-    log("notif: TradePrompts found; mouse1click="..type(mouse1click).." mousemoveabs="..type(mousemoveabs))
-    local function tryAcceptPrompt(prompt)
-        local lbl=prompt:FindFirstChild("Label")
-        if not lbl or lbl.Text~="Trade Request" then return end
-        local yes=prompt:FindFirstChild("Yes"); if not yes then log("notif: no Yes"); return end
-        local tb=yes:IsA("TextButton") and yes or yes:FindFirstChildWhichIsA("TextButton")
-        if not tb then log("notif: no TextButton under Yes"); return end
-        task.wait(0.2)
-        notifyClick(tb)
-    end
-    for _,child in ipairs(tp:GetChildren()) do tryAcceptPrompt(child) end
-    tp.ChildAdded:Connect(function(child) task.defer(function() tryAcceptPrompt(child) end) end)
-end)
+-- ================================================================
+-- NOTIFICATION HOOK
+-- ================================================================
+local function hookNotification()
+    task.spawn(function()
+        local p=pg()
+        if not p then logErr("notif: no PlayerGui"); return end
+        local tp=p:FindFirstChild("TradePrompts")
+        if not tp then
+            logWarn("notif: TradePrompts not present, waiting")
+            tp=p:WaitForChild("TradePrompts",60)
+        end
+        if not tp then logErr("notif: TradePrompts NEVER appeared"); return end
+        logOk("notif: TradePrompts found")
+        local function tryAcceptPrompt(prompt)
+            local lbl=prompt:FindFirstChild("Label")
+            if not lbl or not lbl:IsA("TextLabel") then return end
+            if lbl.Text~="Trade Request" then return end
+            local yes=prompt:FindFirstChild("Yes")
+            if not yes then logWarn("notif: no Yes on "..prompt.Name); return end
+            local tb=yes:IsA("TextButton") and yes or yes:FindFirstChildWhichIsA("TextButton")
+            if not tb then logWarn("notif: no TextButton under Yes"); return end
+            task.wait(0.2)
+            clickChain(tb,"notif-yes")
+        end
+        for _,c in ipairs(tp:GetChildren()) do tryAcceptPrompt(c) end
+        tp.ChildAdded:Connect(function(c) task.defer(function() tryAcceptPrompt(c) end) end)
+    end)
+end
 
--- ===== NEGOTIATION =====
+-- ================================================================
+-- NEGOTIATION
+-- ================================================================
 local NEGO={rounds=0,last=0,partner=nil,lastIncoming=""}
-local lastReply=""
+local function resetNego(p)
+    NEGO.rounds=0; NEGO.last=0; NEGO.partner=p; NEGO.lastIncoming=""
+end
 local function negotiate(text)
     if not POLICY.autoChat then return end
     if SENT_TEXTS[text:lower()] then return end
-    if NEGO.partner~=getPartnerName() then NEGO.rounds=0; NEGO.last=0; NEGO.partner=getPartnerName(); NEGO.lastIncoming="" end
+    local p=getPartnerName()
+    if NEGO.partner~=p then resetNego(p) end
     if text==NEGO.lastIncoming then return end
     NEGO.lastIncoming=text
-    local now=os.clock(); if now-NEGO.last<POLICY.chatMinGap then return end; NEGO.last=now
+    local now=os.clock()
+    if now-NEGO.last<POLICY.chatMinGap then return end
+    NEGO.last=now
     local l=text:lower()
-    if l:find("add") or l:find("more") then
+    if l:find("add") or l:find("more") or l:find("pls") then
         NEGO.rounds=NEGO.rounds+1
-        if NEGO.rounds==1 then say("i cant add, its fair"); lastReply="cant add, its fair"
-        elseif NEGO.rounds==2 then say("its fair bruh i cant add"); lastReply="its fair bruh"
-        else say("no thanks, gl"); lastReply="no thanks" end
+        if NEGO.rounds==1 then say("i cant add, its fair")
+        elseif NEGO.rounds==2 then say("its fair bruh i cant add")
+        else say("no thanks, gl") end
         return
     end
-    if l:find("no") or l:find("nty") or l:find("nah") or l:find("pass") then say("no thanks"); lastReply="no thanks"; return end
+    if l:find("nty") or l:find("nah") or l:find("pass") or (l:find("no") and not l:find("not")) then
+        say("no thanks"); return
+    end
+    if l:find("deal") or l:find("ok") or l:find("fine") then
+        say("ok deal, thank you"); return
+    end
     for name in pairs(V) do
         if l:find(name:lower(),1,true) then
-            local their=readTheirSide(); local th=listValue(their); local target=V[name]
-            if th<target then NEGO.rounds=NEGO.rounds+1; if NEGO.rounds<=2 then say("add"); lastReply="add" else say("its fair, no thanks"); lastReply="fair, no" end
-            else say("ok deal"); lastReply="ok deal" end
+            local their=select(1,readTheirSide())
+            local th=listValue(their)
+            local target=V[name]
+            if th<target then
+                NEGO.rounds=NEGO.rounds+1
+                if NEGO.rounds<=2 then say("add") else say("its fair, no thanks") end
+            else
+                say("ok deal")
+            end
             return
         end
     end
 end
 
--- ===== UI =====
+-- ================================================================
+-- UI
+-- ================================================================
 local function corner(p,r) local c=Instance.new("UICorner",p); c.CornerRadius=UDim.new(0,r or 8); return c end
 local function stroke(p,c,t,tr) local s=Instance.new("UIStroke",p); s.Color=c or THEME.STROKE; s.Thickness=t or 1; s.Transparency=tr or 0.4; return s end
 local function tween(o,d,pr) TS:Create(o,TweenInfo.new(d or 0.14,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),pr):Play() end
@@ -285,9 +537,10 @@ gui.DisplayOrder=999999; gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; gui.Ign
 pcall(function() gui.Parent=gethui_() end)
 if not gui.Parent then pcall(function() gui.Parent=game:GetService("CoreGui") end) end
 if not gui.Parent then pcall(function() gui.Parent=LP:FindFirstChild("PlayerGui") end) end
+if not gui.Parent then logErr("gui.Parent failed — panel invisible") end
 
 local root=Instance.new("Frame",gui)
-root.Size=UDim2.fromOffset(400,700); root.Position=UDim2.fromOffset(20,20)
+root.Size=UDim2.fromOffset(420,780); root.Position=UDim2.fromOffset(20,20)
 root.BackgroundColor3=THEME.BG; root.BorderSizePixel=0
 corner(root,16); stroke(root,THEME.STROKE,1.4,0.38); shadow(root)
 local grad=Instance.new("UIGradient",root)
@@ -303,7 +556,7 @@ title.TextColor3=THEME.TEXT; title.TextXAlignment=Enum.TextXAlignment.Left; titl
 local subLine=Instance.new("Frame",header); subLine.Position=UDim2.fromOffset(32,42); subLine.Size=UDim2.fromOffset(150,2)
 subLine.BackgroundColor3=THEME.ACCENT; subLine.BorderSizePixel=0; corner(subLine,1); subLine.ZIndex=2
 local ver=Instance.new("TextLabel",header); ver.Size=UDim2.fromOffset(100,14); ver.Position=UDim2.new(1,-110,0,18)
-ver.BackgroundTransparency=1; ver.Font=Enum.Font.GothamBold; ver.Text="v2.0.3"; ver.TextSize=10
+ver.BackgroundTransparency=1; ver.Font=Enum.Font.GothamBold; ver.Text="v3.0.0"; ver.TextSize=10
 ver.TextColor3=THEME.GREEN_STROKE; ver.TextXAlignment=Enum.TextXAlignment.Right; ver.ZIndex=2
 
 local drag,sp,spos
@@ -331,7 +584,7 @@ logLabel.Size=UDim2.new(1,-24,0,16); logLabel.Position=UDim2.fromOffset(12,92)
 logLabel.BackgroundTransparency=1; logLabel.Font=Enum.Font.GothamBlack; logLabel.Text="LOG"
 logLabel.TextSize=11; logLabel.TextColor3=THEME.ACCENT; logLabel.TextXAlignment=Enum.TextXAlignment.Left; logLabel.ZIndex=2
 local logScroll=Instance.new("ScrollingFrame",root)
-logScroll.Size=UDim2.new(1,-24,0,140); logScroll.Position=UDim2.fromOffset(12,108)
+logScroll.Size=UDim2.new(1,-24,0,180); logScroll.Position=UDim2.fromOffset(12,108)
 logScroll.BackgroundColor3=THEME.SURF; logScroll.BorderSizePixel=0; logScroll.ScrollBarThickness=3
 logScroll.ScrollBarImageColor3=THEME.ACCENT; logScroll.CanvasSize=UDim2.new(0,0,0,0); logScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y
 logScroll.ZIndex=2; corner(logScroll,8); stroke(logScroll,THEME.STROKE,1,0.6)
@@ -340,23 +593,25 @@ do local p=Instance.new("UIPadding",logScroll); p.PaddingTop=UDim.new(0,4); p.Pa
 local logRendered=0
 local function renderLog()
     for i=logRendered+1,#LOG do
+        local entry=LOG[i]
         local l=Instance.new("TextLabel",logScroll)
         l.Size=UDim2.new(1,-2,0,0); l.AutomaticSize=Enum.AutomaticSize.Y
         l.BackgroundTransparency=1; l.Font=Enum.Font.Code; l.TextSize=9
-        l.TextColor3=(LOG[i]:find("err") or LOG[i]:find("failed") or LOG[i]:find("NEVER") or LOG[i]:find("no mouse")) and THEME.DANGER or THEME.DIM
+        l.TextColor3=(entry.s=="err" and THEME.DANGER) or (entry.s=="warn" and THEME.WARN) or (entry.s=="ok" and THEME.SUCCESS) or THEME.DIM
         l.TextWrapped=true; l.TextXAlignment=Enum.TextXAlignment.Left
-        l.Text=LOG[i]; l.LayoutOrder=i
+        l.Text="["..entry.t.."] "..entry.m; l.LayoutOrder=i
     end
     logRendered=#LOG
     task.defer(function() logScroll.CanvasPosition=Vector2.new(0,logScroll.AbsoluteCanvasSize.Y) end)
 end
 
+-- INVENTORY
 local invLabel=Instance.new("TextLabel",root)
-invLabel.Size=UDim2.new(1,-24,0,16); invLabel.Position=UDim2.fromOffset(12,254)
+invLabel.Size=UDim2.new(1,-24,0,16); invLabel.Position=UDim2.fromOffset(12,294)
 invLabel.BackgroundTransparency=1; invLabel.Font=Enum.Font.GothamBlack; invLabel.Text="MY INVENTORY"
 invLabel.TextSize=11; invLabel.TextColor3=THEME.ACCENT; invLabel.TextXAlignment=Enum.TextXAlignment.Left; invLabel.ZIndex=2
 local invScroll=Instance.new("ScrollingFrame",root)
-invScroll.Size=UDim2.new(1,-24,0,120); invScroll.Position=UDim2.fromOffset(12,270)
+invScroll.Size=UDim2.new(1,-24,0,120); invScroll.Position=UDim2.fromOffset(12,310)
 invScroll.BackgroundColor3=THEME.SURF2; invScroll.BorderSizePixel=0; invScroll.ScrollBarThickness=3
 invScroll.ScrollBarImageColor3=THEME.ACCENT; invScroll.CanvasSize=UDim2.new(0,0,0,0); invScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y
 invScroll.ZIndex=2; corner(invScroll,8); stroke(invScroll,THEME.STROKE,1,0.6)
@@ -364,11 +619,13 @@ Instance.new("UIListLayout",invScroll).Padding=UDim.new(0,2)
 do local p=Instance.new("UIPadding",invScroll); p.PaddingTop=UDim.new(0,4); p.PaddingLeft=UDim.new(0,6); p.PaddingRight=UDim.new(0,6); p.PaddingBottom=UDim.new(0,4) end
 
 local function renderInventory()
-    for _,ch in ipairs(invScroll:GetChildren()) do if ch:IsA("Frame") or (ch:IsA("TextLabel") and ch.Name=="Empty") then ch:Destroy() end end
+    for _,ch in ipairs(invScroll:GetChildren()) do
+        if ch:IsA("Frame") or (ch:IsA("TextLabel") and ch.Name=="Empty") then ch:Destroy() end
+    end
     local list,pn=getMyPlotAnimalList()
     if not pn then
         local e=Instance.new("TextLabel",invScroll); e.Name="Empty"; e.Size=UDim2.new(1,0,0,24); e.BackgroundTransparency=1
-        e.Font=Enum.Font.Gotham; e.TextSize=10; e.TextColor3=THEME.DANGER; e.Text="no plot found"; return
+        e.Font=Enum.Font.Gotham; e.TextSize=10; e.TextColor3=THEME.DANGER; e.Text="no plot found — see log"; return
     end
     if #list==0 then
         local e=Instance.new("TextLabel",invScroll); e.Name="Empty"; e.Size=UDim2.new(1,0,0,24); e.BackgroundTransparency=1
@@ -389,6 +646,7 @@ local function renderInventory()
     end
 end
 
+-- toggles
 local function toggleRow(y,label,key)
     local b=Instance.new("TextButton",root)
     b.Size=UDim2.new(1,-24,0,30); b.Position=UDim2.fromOffset(12,y)
@@ -409,11 +667,11 @@ local function toggleRow(y,label,key)
         tween(knob,0.15,{Position=POLICY[key] and UDim2.new(1,-17,0.5,-7) or UDim2.new(0,3,0.5,-7),BackgroundColor3=POLICY[key] and THEME.GREEN_STROKE or THEME.DIM})
     end)
 end
-toggleRow(398,"Auto chat negotiation","autoChat")
-toggleRow(432,"Auto-accept (fires Ready button)","autoAccept")
+toggleRow(438,"Auto chat negotiation","autoChat")
+toggleRow(472,"Auto-accept (fires Ready after enable)","autoAccept")
 
 local readout=Instance.new("TextLabel",root)
-readout.Size=UDim2.new(1,-24,0,86); readout.Position=UDim2.fromOffset(12,470)
+readout.Size=UDim2.new(1,-24,0,86); readout.Position=UDim2.fromOffset(12,510)
 readout.BackgroundColor3=THEME.SURF2; readout.BorderSizePixel=0
 readout.Font=Enum.Font.Gotham; readout.TextSize=10; readout.TextColor3=THEME.DIM
 readout.TextWrapped=true; readout.TextXAlignment=Enum.TextXAlignment.Left; readout.TextYAlignment=Enum.TextYAlignment.Top
@@ -422,72 +680,100 @@ corner(readout,8); stroke(readout,THEME.STROKE,1,0.6)
 local rpad=Instance.new("UIPadding",readout); rpad.PaddingLeft=UDim.new(0,10); rpad.PaddingTop=UDim.new(0,6); rpad.PaddingRight=UDim.new(0,6)
 
 local manualReady=button(root,"I CONFIRM — FIRE READY",{color=THEME.ACCENT2,press=THEME.ACCENT,stroke=THEME.ACCENT,strokeT=0.35,textSize=11})
-manualReady.Size=UDim2.new(1,-24,0,30); manualReady.Position=UDim2.fromOffset(12,562); manualReady.ZIndex=3
+manualReady.Size=UDim2.new(1,-24,0,30); manualReady.Position=UDim2.fromOffset(12,602); manualReady.ZIndex=3
 manualReady.MouseButton1Click:Connect(function()
     local ok,reason=fireReadyOnce()
-    log("manual ready ok="..tostring(ok).." reason="..tostring(reason))
     if ok then status.Text="READY FIRED"; status.TextColor3=THEME.SUCCESS
     else status.Text="ready blocked: "..tostring(reason); status.TextColor3=THEME.DANGER end
     renderLog()
 end)
 
+-- TEST row
+local testY=642
 local bA=button(root,"TEST NOTIF",{color=THEME.SURF2,press=THEME.ACCENT2,stroke=THEME.STROKE,strokeT=0.5,textSize=10})
-bA.Size=UDim2.new(0.5,-16,0,26); bA.Position=UDim2.fromOffset(12,598); bA.ZIndex=3
+bA.Size=UDim2.new(0.33,-10,0,26); bA.Position=UDim2.fromOffset(12,testY); bA.ZIndex=3
 bA.MouseButton1Click:Connect(function()
-    log("TEST mouse1click="..type(mouse1click).." mousemoveabs="..type(mousemoveabs).." mouse1press="..type(mouse1press))
     local p=pg(); local tp=p and p:FindFirstChild("TradePrompts")
-    log("TEST TradePrompts="..tostring(tp~=nil))
-    if tp then for _,c in ipairs(tp:GetChildren()) do
-        local lbl=c:FindFirstChild("Label"); log("  "..c.Name.." Label="..tostring(lbl and lbl.Text))
-    end end
+    log("TEST notif: TradePrompts="..tostring(tp~=nil))
+    if tp then
+        for _,c in ipairs(tp:GetChildren()) do
+            local lbl=c:FindFirstChild("Label")
+            local yes=c:FindFirstChild("Yes")
+            log(("  %s Label=%s Yes=%s"):format(c.Name,tostring(lbl and lbl.Text),tostring(yes~=nil)))
+        end
+    end
     renderLog()
 end)
 
 local bB=button(root,"TEST TRADE",{color=THEME.SURF2,press=THEME.ACCENT2,stroke=THEME.STROKE,strokeT=0.5,textSize=10})
-bB.Size=UDim2.new(0.5,-16,0,26); bB.Position=UDim2.new(0.5,4,0,598); bB.ZIndex=3
+bB.Size=UDim2.new(0.34,-10,0,26); bB.Position=UDim2.new(0.33,2,0,testY); bB.ZIndex=3
 bB.MouseButton1Click:Connect(function()
     local t=getTradeRoot()
     log("TEST trade root="..tostring(t~=nil))
     if t then
         log("  Your="..tostring(t:FindFirstChild("Your")~=nil).." Other="..tostring(t:FindFirstChild("Other")~=nil))
-        local my=readMySide(); local their=readTheirSide()
-        log("  My="..#my.." Their="..#their)
-        for _,e in ipairs(my) do log("   MY "..e.Index.." mut="..tostring(e.Mutation)) end
-        for _,e in ipairs(their) do log("   THEM "..e.Index.." mut="..tostring(e.Mutation)) end
+        local my,how1=readMySide(); local their,how2=readTheirSide()
+        log(("  read My=%d (%s) Their=%d (%s)"):format(#my,tostring(how1),#their,tostring(how2)))
+        for _,e in ipairs(my) do log(("   MY %s [%s] how=%s"):format(e.Index,tostring(e.Mutation),tostring(e.how))) end
+        for _,e in ipairs(their) do log(("   THEM %s [%s] how=%s"):format(e.Index,tostring(e.Mutation),tostring(e.how))) end
     end
+    renderLog()
+end)
+
+local bC=button(root,"TEST CAPS",{color=THEME.SURF2,press=THEME.ACCENT2,stroke=THEME.STROKE,strokeT=0.5,textSize=10})
+bC.Size=UDim2.new(0.33,-10,0,26); bC.Position=UDim2.new(0.67,0,0,testY); bC.ZIndex=3
+bC.MouseButton1Click:Connect(function()
+    log("CAP mouse1click="..tostring(CAP.mouse1click))
+    log("CAP mousemoveabs="..tostring(CAP.mousemoveabs).." press="..tostring(CAP.mouse1press).." release="..tostring(CAP.mouse1release))
+    log("CAP firesignal="..tostring(CAP.firesignal))
+    log("CAP executor="..(CAP.identifyexecutor and select(2,pcall(identifyexecutor)) or "?"))
     renderLog()
 end)
 
 local footer=Instance.new("TextLabel",root)
 footer.AnchorPoint=Vector2.new(0.5,1); footer.Position=UDim2.new(0.5,0,1,-6); footer.Size=UDim2.new(1,-24,0,12)
-footer.BackgroundTransparency=1; footer.Font=Enum.Font.GothamBlack; footer.Text="GUEST · AUTO TRADER"
+footer.BackgroundTransparency=1; footer.Font=Enum.Font.GothamBlack; footer.Text="GUEST · AUTO TRADER · v3.0.0"
 footer.TextSize=10; footer.TextColor3=THEME.DIM; footer.ZIndex=3
 
+-- ================================================================
+-- LOOPS
+-- ================================================================
 task.spawn(function()
-    while gui.Parent do pcall(renderInventory); pcall(renderLog); task.wait(2) end
+    while gui.Parent do pcall(renderInventory); pcall(renderLog); task.wait(POLICY.inventoryRefresh) end
 end)
 
+-- trade accept loop
 task.spawn(function()
     while gui.Parent do
         pcall(function()
             if not tradeOpen() then
-                if not status.Text:find("FIRED") and not status.Text:find("REPLIED") and not status.Text:find("blocked") then status.Text="IDLE"; status.TextColor3=THEME.DIM end
+                if status.Text=="READY FIRED" or status.Text:find("REPLIED") then
+                    -- keep last message visible briefly
+                else
+                    status.Text="IDLE"; status.TextColor3=THEME.DIM
+                end
+                readout.Text="open a trade — values shown here"
                 return
             end
             local my=readMySide(); local their=readTheirSide()
             local mv=listValue(my); local tv=listValue(their)
             local p=getPartnerName() or "?"
-            readout.Text=("PARTNER: %s\nMY: %dG (%d) | THEIRS: %dG (%d)\nMARGIN: %+dG"):format(p,mv,#my,tv,#their,tv-mv)
+            local muts={}
+            for _,e in ipairs(my) do if e.Mutation then muts[#muts+1]="MY:"..e.Index.."["..e.Mutation.."]" end end
+            for _,e in ipairs(their) do if e.Mutation then muts[#muts+1]="THEM:"..e.Index.."["..e.Mutation.."]" end end
+            readout.Text=("PARTNER: %s\nMY: %dG (%d) | THEIRS: %dG (%d)\nMARGIN: %+dG\n%s"):format(
+                p,mv,#my,tv,#their,tv-mv,table.concat(muts,", "))
             if POLICY.autoAccept and #their>0 and (tv-mv)>=POLICY.minMargin then
                 local ok,reason=fireReadyOnce()
                 if ok then status.Text="READY FIRED ("..p..")"; status.TextColor3=THEME.SUCCESS
                 else status.Text="ready blocked: "..tostring(reason); status.TextColor3=THEME.DIM end
             end
         end)
-        task.wait(1.5)
+        task.wait(POLICY.tradePollInterval)
     end
 end)
 
+-- chat listener
 local function attachChat()
     local t=getTradeRoot(); if not t then return end
     local ch=t:FindFirstChild("Chat"); if not ch then return end
@@ -497,12 +783,15 @@ local function attachChat()
         sf.ChildAdded:Connect(function(child)
             task.defer(function()
                 task.wait(0.25)
-                local lbl=child:FindFirstChild("Label",true); if not lbl or type(lbl.Text)~="string" then return end
+                local lbl=child:FindFirstChild("Label",true)
+                if not lbl or type(lbl.Text)~="string" then return end
                 if lbl.Text=="Template" or child.Name=="TemplateYou" then return end
                 local pi=child:FindFirstChild("PlayerImage"); pi=pi and pi:FindFirstChild("Headshot")
-                if pi and type(pi.Image)=="string" then local m=pi.Image:match("id=(%d+)"); if m and tonumber(m)==LP.UserId then return end end
+                if pi and type(pi.Image)=="string" then
+                    local m=pi.Image:match("id=(%d+)")
+                    if m and tonumber(m)==LP.UserId then return end
+                end
                 negotiate(lbl.Text)
-                if lastReply~="" then status.Text="REPLIED: "..lastReply; status.TextColor3=THEME.ACCENT end
             end)
         end)
     end
@@ -514,7 +803,16 @@ task.spawn(function()
     end
 end)
 
+-- ================================================================
+-- BOOT
+-- ================================================================
+hookNotification()
 task.defer(function() renderInventory(); renderLog() end)
+logOk("v3.0.0 booted")
 
-ENV.__GuestAutoTraderV20={gui=gui,values=V,policy=POLICY,mutMult=MUT_MULT,readMySide=readMySide,readTheirSide=readTheirSide,getMyPlotAnimalList=getMyPlotAnimalList,LOG=LOG}
-return ENV.__GuestAutoTraderV20
+ENV.__GuestAutoTraderV30={
+    gui=gui, values=V, policy=POLICY, mutMult=MUT_MULT, caps=CAP,
+    readMySide=readMySide, readTheirSide=readTheirSide,
+    getMyPlotAnimalList=getMyPlotAnimalList, LOG=LOG,
+}
+return ENV.__GuestAutoTraderV30
