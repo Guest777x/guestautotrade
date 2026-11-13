@@ -1,6 +1,6 @@
--- GuestAutoTrader.lua v1.6.0
--- GuestConvincer branding + Garama value logic + real inventory scan + K2 notification
--- Includes 3 diagnostic buttons that replace executor-console dumps.
+-- GuestAutoTrader.lua v1.7.0
+-- fixes: chat echo spam · mutation misread per-item · natural chat delay
+-- pending: auto-build-offer (needs DUMP B to know how to place items)
 local ENV=(type(getgenv)=="function" and getgenv()) or _G
 if ENV.__GuestAutoTraderV16 then pcall(function() ENV.__GuestAutoTraderV16.gui:Destroy() end) end
 
@@ -23,7 +23,6 @@ local THEME={
     DANGER=Color3.fromRGB(239,68,68), SUCCESS=Color3.fromRGB(34,197,94),
 }
 
--- ===== VALUES =====
 local V={
     ["Garama and Madundung"]=1,
     ["Dragon Cannelloni"]=22,
@@ -47,7 +46,7 @@ local MUT_ALIAS={
     ["Gold/Diamond"]="Gold and Diamond",["Gold Diamond"]="Gold and Diamond",
     ["G&D"]="Gold and Diamond",["Diamond"]="Gold and Diamond",
 }
-local POLICY={minMargin=0,autoAccept=true,autoChat=true,offerShave=0.10,offerFloor=2}
+local POLICY={minMargin=0,autoAccept=true,autoChat=true,chatDelayMin=1.5,chatDelayMax=2.5}
 
 local function mutOf(r)
     if not r or r=="" or r=="None" then return "None" end
@@ -66,9 +65,7 @@ local function itemValue(e)
     return b*(MUT_MULT[mutOf(e.Mutation)] or 1.0)
 end
 local function listValue(l) local t=0 if type(l)~="table" then return 0 end for _,e in ipairs(l) do t=t+itemValue(e) end return t end
-local function offerFor(v) return v-math.min(math.ceil(v*POLICY.offerShave),POLICY.offerFloor) end
 
--- ===== TRADE ROOT =====
 local function pg() return LP:FindFirstChild("PlayerGui") end
 local function getTradeRoot()
     local p=pg(); if not p then return nil end
@@ -93,10 +90,8 @@ local function tradeOpen()
     return false
 end
 
--- ===== REAL INVENTORY SCAN =====
 local Sync=(function() local p=RS:FindFirstChild("Packages"); p=p and p:FindFirstChild("Synchronizer"); if p then local ok,r=pcall(require,p); if ok then return r end end end)()
 local RequestData=(function() local p=RS:FindFirstChild("Packages"); p=p and p:FindFirstChild("Synchronizer"); return p and p:FindFirstChild("RequestData") end)()
-
 local function plotOf(ownerName)
     local plots=workspace:FindFirstChild("Plots"); if not plots or not Sync then return nil end
     for _,c in ipairs(plots:GetChildren()) do
@@ -120,7 +115,37 @@ local function getPlotAnimalList(plotName)
     return {}
 end
 
--- ===== TRADE SIDES =====
+-- ==== per-card mutation finder (BUG 2 fix) ====
+-- Walk UP from the item label until we hit the smallest ancestor that contains
+-- exactly one item-name label. Then search only inside that ancestor.
+local function findMutationFor(label)
+    local node=label.Parent
+    local depth=0
+    while node and node:IsA("GuiObject") and depth<5 do
+        local animalCount=0
+        for _,d in ipairs(node:GetDescendants()) do
+            if d:IsA("TextLabel") and type(d.Text)=="string" then
+                local clean=d.Text:gsub("<[^>]+>",""):gsub("^%s+",""):gsub("%s+$","")
+                if V[clean] then animalCount=animalCount+1 end
+            end
+        end
+        if animalCount==1 then
+            -- this is the card
+            for _,d in ipairs(node:GetDescendants()) do
+                if d~=label and d:IsA("TextLabel") and type(d.Text)=="string" then
+                    local clean=d.Text:gsub("<[^>]+>",""):gsub("^%s+",""):gsub("%s+$","")
+                    local m=mutOf(clean)
+                    if MUT_MULT[m] and m~="None" then return m end
+                end
+            end
+            return nil
+        end
+        node=node.Parent
+        depth=depth+1
+    end
+    return nil
+end
+
 local function getTradeSideLists()
     local t=getTradeRoot(); if not t then return {},{},nil end
     local me,them={}, {}
@@ -153,13 +178,7 @@ local function getTradeSideLists()
                         local full=d:GetFullName():lower()
                         for _,h in ipairs(hints) do
                             if full:find(h,1,true) then
-                                local mut=nil
-                                for _,sib in ipairs(d.Parent:GetChildren()) do
-                                    if sib:IsA("TextLabel") and sib~=d then
-                                        local m=mutOf(sib.Text); if MUT_MULT[m] then mut=m; break end
-                                    end
-                                end
-                                out[#out+1]={Index=clean,Mutation=mut}; break
+                                out[#out+1]={Index=clean,Mutation=findMutationFor(d)}; break
                             end
                         end
                     end
@@ -175,7 +194,8 @@ local function getTradeSideLists()
     return me,them,t
 end
 
--- ===== SAY =====
+-- ==== say with delay + echo tracking (BUG 1 + 4 fix) ====
+local SENT_TEXTS={}
 local function googleTranslate(text,tl,sl)
     if type(HTTP)~="function" or not text or text=="" then return text end
     local ok,res=pcall(function()
@@ -197,9 +217,18 @@ local function getChatBox()
     end
     return nil
 end
+local lastSayAt=0
 local function say(text)
     if not POLICY.autoChat then return false end
+    local now=os.clock()
+    local minGap=POLICY.chatDelayMin or 1.5
+    local wait=math.max(0, minGap-(now-lastSayAt))
+    if wait>0 then task.wait(wait) end
+    -- extra natural delay
+    task.wait(math.random(math.floor(POLICY.chatDelayMin*1000), math.floor(POLICY.chatDelayMax*1000))/1000)
     local box=getChatBox(); if not box then return false end
+    lastSayAt=os.clock()
+    SENT_TEXTS[text:lower()]=os.time()
     return (pcall(function()
         box.Text=googleTranslate(text,"en","auto")
         if type(firesignal)=="function" then firesignal(box.FocusLost,true,Enum.KeyCode.Return)
@@ -207,7 +236,6 @@ local function say(text)
     end))
 end
 
--- ===== BUTTONS =====
 local function clickGui(btn)
     if not btn then return false end
     pcall(function()
@@ -234,22 +262,54 @@ local function findBtn(words)
     return nil
 end
 local function tryReadyButton()
-    local t=getTradeRoot(); if not t then return false end
+    local t=getTradeRoot(); if not t then return nil end
     local other=t:FindFirstChild("Other",true)
     local ready=(other and other:FindFirstChild("ReadyButton",true)) or t:FindFirstChild("ReadyButton",true)
-    if ready then return clickGui(ready) end
-    return false
+    if ready then clickGui(ready); return ready end
+    return nil
 end
 
--- ===== NEGOTIATION =====
-local NEGO={rounds=0,last=0,partner=nil,opened=0}
+-- ==== negotiation with echo guard (BUG 1 fix) ====
+local NEGO={rounds=0,last=0,partner=nil,opened=0,lastIncoming=""}
 local lastReply=""
+
+-- BUY-BUILD STUB (BUG 3+5): cannot implement without DUMP B
+-- When this runs, it needs to know how to click an inventory item's "Add to trade"
+-- button in your game's trade UI. That action's GUI path is exactly what DUMP B shows.
+local function tryBuildOffer(targetValue)
+    local myPlotName=plotOf(LP.Name) or plotOf(LP.DisplayName)
+    if not myPlotName then return false,"no plot" end
+    local myItems=getPlotAnimalList(myPlotName)
+    if #myItems==0 then return false,"plot empty" end
+    -- TODO once DUMP B confirms the click path:
+    --   sort myItems by lowest value >= needed, click each one's "Add" in trade UI
+    --   until listValue(mySide) >= targetValue
+    -- Until then, just report what we WOULD offer:
+    local sorted={}
+    for _,e in ipairs(myItems) do
+        if type(e)=="table" and e.Index and e.Index~="Empty" then sorted[#sorted+1]={e=e,v=itemValue(e)} end
+    end
+    table.sort(sorted,function(a,b) return a.v<b.v end)
+    local sum=0; local pick={}
+    for _,x in ipairs(sorted) do
+        if sum>=targetValue then break end
+        sum=sum+x.v; pick[#pick+1]=x
+    end
+    return false,("would offer: "..#pick.." items = "..math.floor(sum).."G (needs DUMP B to actually place)")
+end
+
 local function negotiate(text)
     if not POLICY.autoChat then return end
-    if NEGO.partner~=getPartnerName() then NEGO.rounds=0; NEGO.last=0; NEGO.partner=getPartnerName() end
-    local now=os.clock(); if now-NEGO.last<2 then return end; NEGO.last=now
+    -- skip our own echoes
+    if SENT_TEXTS[text:lower()] then return end
+    if NEGO.partner~=getPartnerName() then NEGO.rounds=0; NEGO.last=0; NEGO.partner=getPartnerName(); NEGO.lastIncoming="" end
+    if text==NEGO.lastIncoming then return end
+    NEGO.lastIncoming=text
+    local now=os.clock()
+    if now-NEGO.last<2.5 then return end
+    NEGO.last=now
     local l=text:lower()
-    if l:find("add") or l:find("more") or l:find("+") then
+    if l:find("add") or l:find("more") or l:find("%+") then
         NEGO.rounds=NEGO.rounds+1
         if NEGO.rounds==1 then say("i cant add, its fair"); lastReply="cant add, its fair"
         elseif NEGO.rounds==2 then say("its fair bruh i cant add"); lastReply="its fair bruh"
@@ -261,14 +321,21 @@ local function negotiate(text)
         if l:find(name:lower(),1,true) then
             local _,their=getTradeSideLists()
             local th=listValue(their)
-            if th<NEGO.opened then NEGO.rounds=NEGO.rounds+1; if NEGO.rounds<=2 then say("add"); lastReply="add" else say("its fair, no thanks"); lastReply="fair, no" end
-            else say("ok deal"); lastReply="ok deal" end
+            local target=V[name]
+            if th<target then
+                local ok,msg=tryBuildOffer(target)
+                lastReply=msg or "cannot build"
+                NEGO.rounds=NEGO.rounds+1
+                if NEGO.rounds<=2 then say("add") else say("its fair, no thanks") end
+            else
+                say("ok deal"); lastReply="ok deal"
+            end
             return
         end
     end
 end
 
--- ===== UI =====
+-- ==== UI ====
 local function corner(p,r) local c=Instance.new("UICorner",p); c.CornerRadius=UDim.new(0,r or 8); return c end
 local function stroke(p,c,t,tr) local s=Instance.new("UIStroke",p); s.Color=c or THEME.STROKE; s.Thickness=t or 1; s.Transparency=tr or 0.4; return s end
 local function tween(o,d,pr) TS:Create(o,TweenInfo.new(d or 0.14,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),pr):Play() end
@@ -309,7 +376,7 @@ title.TextColor3=THEME.TEXT; title.TextXAlignment=Enum.TextXAlignment.Left; titl
 local subLine=Instance.new("Frame",header); subLine.Position=UDim2.fromOffset(32,42); subLine.Size=UDim2.fromOffset(150,2)
 subLine.BackgroundColor3=THEME.ACCENT; subLine.BorderSizePixel=0; corner(subLine,1); subLine.ZIndex=2
 local ver=Instance.new("TextLabel",header); ver.Size=UDim2.fromOffset(80,14); ver.Position=UDim2.new(1,-96,0,18)
-ver.BackgroundTransparency=1; ver.Font=Enum.Font.GothamBold; ver.Text="v1.6.0"; ver.TextSize=10
+ver.BackgroundTransparency=1; ver.Font=Enum.Font.GothamBold; ver.Text="v1.7.0"; ver.TextSize=10
 ver.TextColor3=THEME.DIM; ver.TextXAlignment=Enum.TextXAlignment.Right; ver.ZIndex=2
 
 local drag,sp,spos
@@ -332,15 +399,84 @@ status.Font=Enum.Font.GothamBold; status.Text="IDLE"; status.TextSize=11; status
 status.TextXAlignment=Enum.TextXAlignment.Left; status.ZIndex=2
 Instance.new("UIPadding",status).PaddingLeft=UDim.new(0,10)
 
--- diagnostics row
 local function diagBtn(x,w,label,fn)
     local b=button(root,label,{color=THEME.SURF2,press=THEME.ACCENT2,stroke=THEME.STROKE,strokeT=0.5,textSize=10})
     b.Size=UDim2.fromOffset(w,26); b.Position=UDim2.fromOffset(x,92); b.ZIndex=3
     b.MouseButton1Click:Connect(fn)
     return b
 end
+local DUMP_OUT=""
+local dumpPreview
 
--- MY INVENTORY
+local function collectDumpA()
+    local lines={}
+    local p=pg(); if not p then return "no PlayerGui" end
+    for _,sg in ipairs(p:GetChildren()) do
+        if sg:IsA("ScreenGui") and sg.Enabled then
+            lines[#lines+1]="SG: "..sg.Name
+            for _,d in ipairs(sg:GetDescendants()) do
+                if d:IsA("TextLabel") and #d.Text>1 then lines[#lines+1]="  LBL: "..d:GetFullName().." = "..d.Text end
+                if d:IsA("TextButton") then lines[#lines+1]="  BTN: "..d:GetFullName().." text="..d.Text end
+            end
+        end
+    end
+    return table.concat(lines,"\n")
+end
+local function collectDumpB()
+    local t=getTradeRoot(); if not t then return "no trade open" end
+    local lines={}
+    for _,d in ipairs(t:GetDescendants()) do
+        if d:IsA("TextLabel") and #d.Text>1 then lines[#lines+1]="LBL: "..d:GetFullName().." = "..d.Text end
+        if d:IsA("ImageLabel") and d.Image~="" then lines[#lines+1]="IMG: "..d:GetFullName().." = "..d.Image end
+        if d:IsA("TextButton") then lines[#lines+1]="BTN: "..d:GetFullName().." text="..d.Text end
+        if d:IsA("StringValue") or d:IsA("ObjectValue") then lines[#lines+1]="VAL: "..d:GetFullName().." = "..tostring(d.Value) end
+        local attrs=d:GetAttributes()
+        if next(attrs)~=nil then
+            lines[#lines+1]="ATTR: "..d:GetFullName()
+            for k,v in pairs(attrs) do lines[#lines+1]="   "..k.." = "..tostring(v) end
+        end
+    end
+    return table.concat(lines,"\n")
+end
+local function collectDumpC()
+    local lines={}
+    if not Sync then lines[#lines+1]="Synchronizer missing"; return table.concat(lines,"\n") end
+    local plots=workspace:FindFirstChild("Plots"); if not plots then return "Plots missing" end
+    for _,p in ipairs(plots:GetChildren()) do
+        local ok,t=pcall(function() return Sync:GetTableFromChannel(p.Name) end)
+        if ok and type(t)=="table" then
+            local n=typeof(t.Owner)=="Instance" and t.Owner.Name or tostring(t.Owner)
+            if n==LP.Name or n==LP.DisplayName then
+                lines[#lines+1]="MY PLOT: "..p.Name
+                for k,v in pairs(t) do lines[#lines+1]="  field: "..k.." ("..type(v)..")" end
+                if type(t.AnimalList)=="table" then
+                    for i,e in ipairs(t.AnimalList) do
+                        lines[#lines+1]="  animal "..i..": "..(type(e)=="table" and (tostring(e.Index).." mut="..tostring(e.Mutation)) or tostring(e))
+                    end
+                end
+            end
+        end
+    end
+    if #lines==0 then lines[#lines+1]="no plot owned by "..LP.Name end
+    return table.concat(lines,"\n")
+end
+
+diagBtn(12,118,"DUMP A (notif)",function()
+    DUMP_OUT=collectDumpA(); pcall(CLIP,DUMP_OUT)
+    status.Text="DUMP A copied ("..#DUMP_OUT.." chars)"; status.TextColor3=THEME.SUCCESS
+    if dumpPreview then dumpPreview.Text=DUMP_OUT end
+end)
+diagBtn(136,118,"DUMP B (trade)",function()
+    DUMP_OUT=collectDumpB(); pcall(CLIP,DUMP_OUT)
+    status.Text="DUMP B copied ("..#DUMP_OUT.." chars)"; status.TextColor3=THEME.SUCCESS
+    if dumpPreview then dumpPreview.Text=DUMP_OUT end
+end)
+diagBtn(260,128,"DUMP C (my plot)",function()
+    DUMP_OUT=collectDumpC(); pcall(CLIP,DUMP_OUT)
+    status.Text="DUMP C copied ("..#DUMP_OUT.." chars)"; status.TextColor3=THEME.SUCCESS
+    if dumpPreview then dumpPreview.Text=DUMP_OUT end
+end)
+
 local invLabel=Instance.new("TextLabel",root)
 invLabel.Size=UDim2.new(1,-24,0,16); invLabel.Position=UDim2.fromOffset(12,126)
 invLabel.BackgroundTransparency=1; invLabel.Font=Enum.Font.GothamBlack; invLabel.Text="MY INVENTORY"
@@ -353,25 +489,23 @@ invScroll.Size=UDim2.new(1,-24,0,150); invScroll.Position=UDim2.fromOffset(12,15
 invScroll.BackgroundColor3=THEME.SURF2; invScroll.BorderSizePixel=0; invScroll.ScrollBarThickness=3
 invScroll.ScrollBarImageColor3=THEME.ACCENT; invScroll.CanvasSize=UDim2.new(0,0,0,0); invScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y
 invScroll.ZIndex=2; corner(invScroll,8); stroke(invScroll,THEME.STROKE,1,0.6)
-local il=Instance.new("UIListLayout",invScroll); il.Padding=UDim.new(0,2)
-local ipad=Instance.new("UIPadding",invScroll); ipad.PaddingTop=UDim.new(0,4); ipad.PaddingLeft=UDim.new(0,6); ipad.PaddingRight=UDim.new(0,6); ipad.PaddingBottom=UDim.new(0,4)
+Instance.new("UIListLayout",invScroll).Padding=UDim.new(0,2)
+do local p=Instance.new("UIPadding",invScroll); p.PaddingTop=UDim.new(0,4); p.PaddingLeft=UDim.new(0,6); p.PaddingRight=UDim.new(0,6); p.PaddingBottom=UDim.new(0,4) end
 
 local function renderInventory()
-    for _,ch in ipairs(invScroll:GetChildren()) do
-        if ch:IsA("Frame") or (ch:IsA("TextLabel") and ch.Name=="Empty") then ch:Destroy() end
-    end
+    for _,ch in ipairs(invScroll:GetChildren()) do if ch:IsA("Frame") or (ch:IsA("TextLabel") and ch.Name=="Empty") then ch:Destroy() end end
     local pn=plotOf(LP.Name) or plotOf(LP.DisplayName)
     if not pn then
         local e=Instance.new("TextLabel",invScroll); e.Name="Empty"; e.Size=UDim2.new(1,0,0,44); e.BackgroundTransparency=1
         e.Font=Enum.Font.Gotham; e.TextSize=10; e.TextColor3=THEME.DIM; e.TextWrapped=true
-        e.Text="no plot found — click DUMP C and paste output"
+        e.Text="no plot found — click DUMP C"
         return
     end
     local list=getPlotAnimalList(pn)
     if #list==0 then
         local e=Instance.new("TextLabel",invScroll); e.Name="Empty"; e.Size=UDim2.new(1,0,0,44); e.BackgroundTransparency=1
         e.Font=Enum.Font.Gotham; e.TextSize=10; e.TextColor3=THEME.DIM; e.TextWrapped=true
-        e.Text="plot found ("..pn..") but AnimalList empty — click DUMP C"
+        e.Text="plot found ("..pn..") — click DUMP C"
         return
     end
     for i,e in ipairs(list) do
@@ -379,9 +513,8 @@ local function renderInventory()
             local row=Instance.new("Frame",invScroll); row.Size=UDim2.new(1,-2,0,24); row.BackgroundColor3=THEME.SURF
             row.BorderSizePixel=0; row.LayoutOrder=i; corner(row,6)
             local mut=e.Mutation and e.Mutation~="None" and e.Mutation or nil
-            local label=e.Index..(mut and (" ["..tostring(mut).."]") or "")
             local t=Instance.new("TextLabel",row); t.Size=UDim2.new(1,-58,1,0); t.Position=UDim2.fromOffset(8,0)
-            t.BackgroundTransparency=1; t.Text=label; t.Font=Enum.Font.GothamMedium; t.TextSize=10
+            t.BackgroundTransparency=1; t.Text=e.Index..(mut and (" ["..tostring(mut).."]") or ""); t.Font=Enum.Font.GothamMedium; t.TextSize=10
             t.TextColor3=THEME.TEXT; t.TextXAlignment=Enum.TextXAlignment.Left; t.TextTruncate=Enum.TextTruncate.AtEnd
             local g=Instance.new("TextLabel",row); g.Size=UDim2.fromOffset(50,24); g.Position=UDim2.new(1,-54,0,0)
             g.BackgroundTransparency=1; g.Text=tostring(math.floor(itemValue(e))).."G"; g.Font=Enum.Font.GothamBold
@@ -390,83 +523,9 @@ local function renderInventory()
     end
 end
 
--- diagnostic buttons that COPY dump output to clipboard
-local DUMP_OUT=""
-
-local function collectDumpA()
-    local lines={}
-    local p=pg(); if not p then return "no PlayerGui" end
-    for _,sg in ipairs(p:GetChildren()) do
-        if sg:IsA("ScreenGui") and sg.Enabled then
-            table.insert(lines,"SG: "..sg.Name)
-            for _,d in ipairs(sg:GetDescendants()) do
-                if d:IsA("TextLabel") and #d.Text>1 then table.insert(lines,"  LBL: "..d:GetFullName().." = "..d.Text) end
-                if d:IsA("TextButton") then table.insert(lines,"  BTN: "..d:GetFullName().." text="..d.Text) end
-            end
-        end
-    end
-    return table.concat(lines,"\n")
-end
-
-local function collectDumpB()
-    local t=getTradeRoot(); if not t then return "no trade open" end
-    local lines={}
-    for _,d in ipairs(t:GetDescendants()) do
-        if d:IsA("TextLabel") and #d.Text>1 then table.insert(lines,"LBL: "..d:GetFullName().." = "..d.Text) end
-        if d:IsA("ImageLabel") and d.Image~="" then table.insert(lines,"IMG: "..d:GetFullName().." = "..d.Image) end
-        if d:IsA("TextButton") then table.insert(lines,"BTN: "..d:GetFullName().." text="..d.Text) end
-        if d:IsA("StringValue") or d:IsA("ObjectValue") then table.insert(lines,"VAL: "..d:GetFullName().." = "..tostring(d.Value)) end
-        local attrs=d:GetAttributes()
-        if next(attrs)~=nil then
-            table.insert(lines,"ATTR: "..d:GetFullName())
-            for k,v in pairs(attrs) do table.insert(lines,"   "..k.." = "..tostring(v)) end
-        end
-    end
-    return table.concat(lines,"\n")
-end
-
-local function collectDumpC()
-    local lines={}
-    if not Sync then lines[#lines+1]="Synchronizer missing"; return table.concat(lines,"\n") end
-    local plots=workspace:FindFirstChild("Plots"); if not plots then return "Plots missing" end
-    local lp=LP.Name
-    for _,p in ipairs(plots:GetChildren()) do
-        local ok,t=pcall(function() return Sync:GetTableFromChannel(p.Name) end)
-        if ok and type(t)=="table" then
-            local owner=t.Owner
-            local n=typeof(owner)=="Instance" and owner.Name or tostring(owner)
-            if n==lp or n==LP.DisplayName then
-                lines[#lines+1]="MY PLOT: "..p.Name
-                for k,v in pairs(t) do lines[#lines+1]="  field: "..k.." ("..type(v)..")" end
-                if type(t.AnimalList)=="table" then
-                    for i,e in ipairs(t.AnimalList) do
-                        lines[#lines+1]="  animal "..i..": "..(type(e)=="table" and (tostring(e.Index).." mut="..tostring(e.Mutation)) or tostring(e))
-                    end
-                end
-            end
-        end
-    end
-    if #lines==0 then lines[#lines+1]="no plot owned by "..lp.." found" end
-    return table.concat(lines,"\n")
-end
-
-diagBtn(12,118,"DUMP A (notif)",function()
-    DUMP_OUT=collectDumpA(); pcall(CLIP,DUMP_OUT)
-    status.Text="DUMP A copied ("..#DUMP_OUT.." chars)"; status.TextColor3=THEME.SUCCESS
-end)
-diagBtn(136,118,"DUMP B (trade)",function()
-    DUMP_OUT=collectDumpB(); pcall(CLIP,DUMP_OUT)
-    status.Text="DUMP B copied ("..#DUMP_OUT.." chars)"; status.TextColor3=THEME.SUCCESS
-end)
-diagBtn(260,128,"DUMP C (my plot)",function()
-    DUMP_OUT=collectDumpC(); pcall(CLIP,DUMP_OUT)
-    status.Text="DUMP C copied ("..#DUMP_OUT.." chars)"; status.TextColor3=THEME.SUCCESS
-end)
-
--- SET VALUE
 local vLabel=Instance.new("TextLabel",root)
 vLabel.Size=UDim2.new(1,-24,0,16); vLabel.Position=UDim2.fromOffset(12,310)
-vLabel.BackgroundTransparency=1; vLabel.Font=Enum.Font.GothamBlack; vLabel.Text="SET VALUE / READOUT"
+vLabel.BackgroundTransparency=1; vLabel.Font=Enum.Font.GothamBlack; vLabel.Text="SET VALUE"
 vLabel.TextSize=11; vLabel.TextColor3=THEME.ACCENT; vLabel.TextXAlignment=Enum.TextXAlignment.Left; vLabel.ZIndex=2
 local vLine=Instance.new("Frame",root); vLine.Size=UDim2.new(1,-24,0,1); vLine.Position=UDim2.fromOffset(12,328)
 vLine.BackgroundColor3=THEME.STROKE; vLine.BackgroundTransparency=0.6; vLine.BorderSizePixel=0; vLine.ZIndex=2
@@ -492,14 +551,11 @@ local setBtn=button(root,"SET",{color=THEME.SURF2,press=THEME.ACCENT2,stroke=THE
 setBtn.Size=UDim2.fromOffset(120,30); setBtn.Position=UDim2.new(1,-132,0,336); setBtn.ZIndex=3
 setBtn.MouseButton1Click:Connect(function()
     local n=vInput.Text; local num=tonumber(nInput.Text)
-    if n=="" or not num then
-        status.Text="NEED NAME + NUMBER"; status.TextColor3=THEME.DANGER; return
-    end
+    if n=="" or not num then status.Text="NEED NAME + NUMBER"; status.TextColor3=THEME.DANGER; return end
     V[n]=num; vInput.Text=""; nInput.Text=""; renderInventory()
     status.Text=("SET: %s = %dG"):format(n,num); status.TextColor3=THEME.SUCCESS
 end)
 
--- toggles
 local function toggleRow(y,label,key)
     local b=Instance.new("TextButton",root)
     b.Size=UDim2.new(1,-24,0,32); b.Position=UDim2.fromOffset(12,y)
@@ -523,7 +579,6 @@ end
 toggleRow(374,"Auto-accept fair trades","autoAccept")
 toggleRow(410,"Auto chat negotiation","autoChat")
 
--- readout
 local readout=Instance.new("TextLabel",root)
 readout.Size=UDim2.new(1,-24,0,64); readout.Position=UDim2.fromOffset(12,450)
 readout.BackgroundColor3=THEME.SURF2; readout.BorderSizePixel=0
@@ -533,8 +588,7 @@ readout.Text="open a trade — values shown here"; readout.ZIndex=2
 corner(readout,8); stroke(readout,THEME.STROKE,1,0.6)
 local rpad=Instance.new("UIPadding",readout); rpad.PaddingLeft=UDim.new(0,10); rpad.PaddingTop=UDim.new(0,6); rpad.PaddingRight=UDim.new(0,6)
 
--- latest dump preview
-local dumpPreview=Instance.new("TextBox",root)
+dumpPreview=Instance.new("TextBox",root)
 dumpPreview.Size=UDim2.new(1,-24,0,120); dumpPreview.Position=UDim2.fromOffset(12,522)
 dumpPreview.BackgroundColor3=THEME.SURF; dumpPreview.BorderSizePixel=0
 dumpPreview.Font=Enum.Font.Code; dumpPreview.TextSize=9; dumpPreview.TextColor3=THEME.DIM
@@ -543,41 +597,20 @@ dumpPreview.MultiLine=true; dumpPreview.TextEditable=false; dumpPreview.ClearTex
 dumpPreview.ZIndex=2; corner(dumpPreview,8); stroke(dumpPreview,THEME.STROKE,1,0.6)
 Instance.new("UIPadding",dumpPreview).PaddingLeft=UDim.new(0,6)
 
-local function setDumpPreview()
-    dumpPreview.Text=DUMP_OUT
-end
-diagBtn_origA=diagBtn
--- hook the 3 buttons again to also preview
-do
-    local btns={}
-    -- re-bind via find
-    for _,c in ipairs(root:GetChildren()) do
-        if c:IsA("TextButton") and c.Text:find("DUMP") then
-            local orig=c.MouseButton1Click
-            c.MouseButton1Click:Connect(function() task.wait(0.05); setDumpPreview() end)
-        end
-    end
-end
-
 local footer=Instance.new("TextLabel",root)
 footer.AnchorPoint=Vector2.new(0.5,1); footer.Position=UDim2.new(0.5,0,1,-6); footer.Size=UDim2.new(1,-24,0,12)
 footer.BackgroundTransparency=1; footer.Font=Enum.Font.GothamBlack; footer.Text="GUEST · AUTO TRADER"
 footer.TextSize=10; footer.TextColor3=THEME.DIM; footer.ZIndex=3
 
--- ===== LOOPS =====
 task.spawn(function()
-    while gui.Parent do
-        pcall(renderInventory)
-        task.wait(3)
-    end
+    while gui.Parent do pcall(renderInventory); task.wait(3) end
 end)
 
--- K2 notification hook (retargets itself if it can't find the default path)
 task.spawn(function()
     local p=pg(); if not p then return end
-    local root2=p:FindFirstChild("DuelsMachinePrompt") or p:WaitForChild("DuelsMachinePrompt",60)
-    if not root2 then return end
-    local container=root2:FindFirstChild("DuelsMachinePrompt") or root2
+    local r2=p:FindFirstChild("DuelsMachinePrompt") or p:WaitForChild("DuelsMachinePrompt",60)
+    if not r2 then return end
+    local container=r2:FindFirstChild("DuelsMachinePrompt") or r2
     local function onPrompt(child)
         if child.Name~="Prompt" then return end
         task.defer(function()
@@ -592,13 +625,12 @@ task.spawn(function()
     for _,c in ipairs(container:GetChildren()) do onPrompt(c) end
 end)
 
--- accept loop
 local lastSig=nil; local lastT=0
 task.spawn(function()
     while gui.Parent do
         pcall(function()
             if not tradeOpen() then
-                if not status.Text:find("ACCEPT") and not status.Text:find("DUMP") and not status.Text:find("SET") and not status.Text:find("REPLIED") then
+                if not status.Text:find("ACCEPT") and not status.Text:find("DUMP") and not status.Text:find("SET") and not status.Text:find("REPLIED") and not status.Text:find("WAIT") and not status.Text:find("TRADE") then
                     status.Text="IDLE"; status.TextColor3=THEME.DIM
                 end
                 readout.Text="open a trade — values shown here"
@@ -609,25 +641,15 @@ task.spawn(function()
             local p=getPartnerName() or "?"
             readout.Text=("PARTNER: %s\nMY: %dG (%d) | THEIRS: %dG (%d)\nMARGIN: %+dG"):format(p,mv,#my,tv,#their,tv-mv)
             if not POLICY.autoAccept then return end
-            if #their==0 then
-                status.Text="TRADE OPEN — THEIRS 0"; status.TextColor3=THEME.DIM
-                return
-            end
-            if (tv-mv)<POLICY.minMargin then
-                status.Text=("WAIT — MARGIN %+dG"):format(tv-mv); status.TextColor3=THEME.DIM
-                return
-            end
+            if #their==0 then status.Text="TRADE OPEN — THEIRS 0"; status.TextColor3=THEME.DIM; return end
+            if (tv-mv)<POLICY.minMargin then status.Text=("WAIT — MARGIN %+dG"):format(tv-mv); status.TextColor3=THEME.DIM; return end
             local sig=("%s|%d|%d"):format(p,mv,tv)
             if sig==lastSig and (os.clock()-lastT)<4 then return end
             local clicked=false
             if tryReadyButton() then clicked=true end
-            if not clicked then
-                local b=findBtn({"accept","confirm"})
-                if b then clickGui(b); clicked=true end
-            end
+            if not clicked then local b=findBtn({"accept","confirm"}); if b then clickGui(b); clicked=true end end
             if clicked then
-                lastSig=sig; lastT=os.clock()
-                say("deal, thanks")
+                lastSig=sig; lastT=os.clock(); say("deal, thanks")
                 status.Text="ACCEPTED: "..p; status.TextColor3=THEME.SUCCESS
             else
                 status.Text="FAIR — NO BTN"; status.TextColor3=THEME.DANGER
@@ -637,7 +659,6 @@ task.spawn(function()
     end
 end)
 
--- chat listener
 local function attachChat()
     local t=getTradeRoot(); if not t then return end
     local ch=t:FindFirstChild("Chat"); if not ch then return end
