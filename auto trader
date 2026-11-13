@@ -1,5 +1,4 @@
--- GuestAutoTrader.lua v1.3.0  — self-contained, on-screen UI, no console needed
--- Brand: GUEST AUTO TRADER  |  Style: GuestConvincer v4.1.0 theme
+-- GuestAutoTrader.lua v1.3.1  — fixes: idle when partner name not yet readable
 local ENV=(type(getgenv)=="function" and getgenv()) or _G
 if ENV.__GuestAutoTraderV13 then pcall(function() ENV.__GuestAutoTraderV13.gui:Destroy() end) end
 
@@ -12,7 +11,6 @@ local LP=Players.LocalPlayer
 local HTTP=(syn and syn.request) or http_request or request
 local gethui_=gethui or function() return game:GetService("CoreGui") end
 
--- ============ THEME (GuestConvincer) ============
 local THEME={
     BG=Color3.fromRGB(10,12,20), SURF=Color3.fromRGB(18,21,32), SURF2=Color3.fromRGB(26,30,44),
     TEXT=Color3.fromRGB(226,232,240), DIM=Color3.fromRGB(148,163,184),
@@ -21,7 +19,6 @@ local THEME={
     DANGER=Color3.fromRGB(239,68,68), SUCCESS=Color3.fromRGB(34,197,94),
 }
 
--- ============ VALUES ============
 local V={
     ["Garama and Madundung"]=1,
     ["Dragon Cannelloni"]=22,
@@ -39,7 +36,6 @@ local POLICY={minMargin=0,askMarkup=0.10,askCap=2,offerShave=0.10,offerFloor=2,a
 local function mutOf(r) if not r or r=="" or r=="None" then return "None" end return MUT_ALIAS[r] or r end
 local function itemValue(e) if type(e)~="table" then return 0 end local b=V[e.Index]; if not b then return 0 end return b*(MUT_MULT[mutOf(e.Mutation)] or 1.0) end
 local function listValue(l) local t=0 if type(l)~="table" then return 0 end for _,e in ipairs(l) do t=t+itemValue(e) end return t end
-local function askFor(v) return v+math.min(math.ceil(v*POLICY.askMarkup),POLICY.askCap) end
 local function offerFor(v) return v-math.min(math.ceil(v*POLICY.offerShave),POLICY.offerFloor) end
 
 -- ============ TRADE ROOT ============
@@ -49,41 +45,97 @@ local function getTradeRoot()
     local tl=p:FindFirstChild("TradeLiveTrade"); if not tl then return nil end
     return tl:FindFirstChild("TradeLiveTrade") or tl
 end
+
+-- partner name is best-effort; nil must NOT stop processing
 local function getPartnerName()
     local t=getTradeRoot(); if not t then return nil end
     local o=t:FindFirstChild("Other"); if not o then return nil end
     local u=o:FindFirstChild("Username")
-    if u and u:IsA("TextLabel") then return (u.Text:match("@([%w_]+)") or u.Text) end
+    if u and u:IsA("TextLabel") then
+        local m=u.Text:match("@([%w_]+)")
+        if m then return m end
+        if u.Text~="" and u.Text~="@" then return u.Text end
+    end
     return nil
 end
 
-local function readSide(which)
-    local t=getTradeRoot(); if not t then return {} end
-    local names=which=="me" and {"YourItems","MyItems","YourOffer","MyOffer"} or {"TheirItems","TheirOffer"}
-    local side
-    for _,n in ipairs(names) do side=t:FindFirstChild(n,true); if side then break end end
-    if not side then
-        for _,d in ipairs(t:GetDescendants()) do
-            if d:IsA("GuiObject") then
-                for _,l in ipairs(d:GetDescendants()) do
-                    if l:IsA("TextLabel") and V[l.Text] then side=d; break end
+-- True iff any trade frame is present with either side populated
+local function tradeOpen()
+    local t=getTradeRoot()
+    if not t then return false end
+    -- presence of Accept button is the strongest signal
+    for _,d in ipairs(t:GetDescendants()) do
+        if (d:IsA("TextButton") or d:IsA("ImageButton")) and (d.Text or ""):lower():find("accept") then return true end
+    end
+    -- fallback: existence of Other panel
+    return t:FindFirstChild("Other") ~= nil
+end
+
+-- ============ SIDE READERS (robust) ============
+-- Strategy: find the trade root. Collect ALL items anywhere under it.
+-- Split by which side is mine: any label under a subtree whose name mentions
+-- "Your"/"My" is mine; else treat text containing a known animal as theirs.
+local function readAll()
+    local t=getTradeRoot(); if not t then return {},{},{} end
+    local my,their={}, {}
+    local seen={}
+
+    local function mutFromSiblings(label)
+        for _,sib in ipairs(label.Parent:GetChildren()) do
+            if sib~=label and sib:IsA("TextLabel") then
+                local m=mutOf(sib.Text)
+                if MUT_MULT[m] then return m end
+            end
+        end
+        return nil
+    end
+
+    local function isMineSubtree(node)
+        local n=node:GetFullName():lower()
+        return n:find("youritems",1,true) or n:find("yourtrade",1,true)
+            or n:find("your side",1,true) or n:find("myitems",1,true)
+            or n:find("myoffer",1,true) or n:find("yourside",1,true)
+            or n:find("offering",1,true)
+    end
+    local function isTheirSubtree(node)
+        local n=node:GetFullName():lower()
+        return n:find("theiritems",1,true) or n:find("theirtrade",1,true)
+            or n:find("their side",1,true) or n:find("theirside",1,true)
+            or n:find("theiroffer",1,true) or n:find("requesting",1,true)
+    end
+
+    for _,d in ipairs(t:GetDescendants()) do
+        if d:IsA("TextLabel") and type(d.Text)=="string" and V[d.Text] then
+            local full=d:GetFullName()
+            if not seen[full] then
+                seen[full]=true
+                local entry={Index=d.Text,Mutation=mutFromSiblings(d)}
+                if isMineSubtree(d) then my[#my+1]=entry
+                elseif isTheirSubtree(d) then their[#their+1]=entry
+                else
+                    -- ambiguous; queue for later heuristic
+                    entry.__amb=true; my[#my+1]=entry
                 end
-                if side then break end
             end
         end
     end
-    if not side then return {} end
-    local out={}
-    for _,d in ipairs(side:GetDescendants()) do
-        if d:IsA("TextLabel") and V[d.Text] then
-            local mut=nil
-            for _,sib in ipairs(d.Parent:GetChildren()) do
-                if sib:IsA("TextLabel") and sib~=d then local m=mutOf(sib.Text); if MUT_MULT[m] then mut=m; break end end
-            end
-            out[#out+1]={Index=d.Text,Mutation=mut}
+    -- any ambiguous left in my -> if their empty and my has >1, split evenly-ish
+    if #their==0 and #my>0 then
+        local amb={}
+        for i=#my,1,-1 do if my[i].__amb then table.insert(amb,1,my[i]); table.remove(my,i) end end
+        if #amb>0 then
+            for i,e in ipairs(amb) do e.__amb=nil; their[#their+1]=e end
         end
     end
-    return out
+    for _,e in ipairs(my) do e.__amb=nil end
+    for _,e in ipairs(their) do e.__amb=nil end
+    return my,their,t
+end
+
+-- back-compat shims
+local function readSide(which)
+    local my,their=readAll()
+    return which=="me" and my or their
 end
 
 -- ============ SAY / TRANSLATE ============
@@ -157,7 +209,8 @@ local function negotiate(text)
     if l:find("no") or l:find("nty") or l:find("nah") or l:find("pass") then say("no thanks"); lastReply="no thanks"; return end
     for name in pairs(V) do
         if l:find(name:lower(),1,true) then
-            local my=listValue(readSide("me")); local th=listValue(readSide("them"))
+            local my,their=readAll()
+            local th=listValue(their)
             if th<NEGO.opened then NEGO.rounds=NEGO.rounds+1; if NEGO.rounds<=2 then say("add"); lastReply="add" else say("its fair, no thanks"); lastReply="fair, no" end
             else say("ok deal"); lastReply="ok deal" end
             return
@@ -202,7 +255,7 @@ local function buyFrom(name)
     return true,("offer %d to %s"):format(math.floor(off),owner)
 end
 
--- ============ UI (GuestConvincer theme) ============
+-- ============ UI ============
 local function corner(p,r) local c=Instance.new("UICorner",p); c.CornerRadius=UDim.new(0,r or 8); return c end
 local function stroke(p,c,t,tr) local s=Instance.new("UIStroke",p); s.Color=c or THEME.STROKE; s.Thickness=t or 1; s.Transparency=tr or 0.4; return s end
 local function tween(o,d,pr) TS:Create(o,TweenInfo.new(d or 0.14,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),pr):Play() end
@@ -227,14 +280,13 @@ local gui=Instance.new("ScreenGui"); gui.Name="GuestAutoTrader"; gui.ResetOnSpaw
 gui.DisplayOrder=999999; gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; gui.IgnoreGuiInset=true; gui.Parent=gethui_()
 
 local root=Instance.new("Frame",gui)
-root.Size=UDim2.fromOffset(360,540); root.Position=UDim2.fromOffset(20,100)
+root.Size=UDim2.fromOffset(360,560); root.Position=UDim2.fromOffset(20,80)
 root.BackgroundColor3=THEME.BG; root.BorderSizePixel=0
 corner(root,16); stroke(root,THEME.STROKE,1.4,0.38); shadow(root)
 local grad=Instance.new("UIGradient",root)
 grad.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(24,27,42)),ColorSequenceKeypoint.new(1,Color3.fromRGB(12,14,22))})
 grad.Rotation=90
 
--- header
 local header=Instance.new("Frame",root); header.Size=UDim2.new(1,0,0,52); header.BackgroundTransparency=1; header.ZIndex=2
 local accentBar=Instance.new("Frame",header); accentBar.Size=UDim2.fromOffset(8,8); accentBar.Position=UDim2.fromOffset(16,22)
 accentBar.BackgroundColor3=THEME.ACCENT; accentBar.BorderSizePixel=0; corner(accentBar,4); accentBar.ZIndex=2
@@ -244,7 +296,7 @@ title.TextColor3=THEME.TEXT; title.TextXAlignment=Enum.TextXAlignment.Left; titl
 local subLine=Instance.new("Frame",header); subLine.Position=UDim2.fromOffset(32,42); subLine.Size=UDim2.fromOffset(150,2)
 subLine.BackgroundColor3=THEME.ACCENT; subLine.BorderSizePixel=0; corner(subLine,1); subLine.ZIndex=2
 local ver=Instance.new("TextLabel",header); ver.Size=UDim2.fromOffset(80,14); ver.Position=UDim2.new(1,-96,0,18)
-ver.BackgroundTransparency=1; ver.Font=Enum.Font.GothamBold; ver.Text="v1.3.0"; ver.TextSize=10
+ver.BackgroundTransparency=1; ver.Font=Enum.Font.GothamBold; ver.Text="v1.3.1"; ver.TextSize=10
 ver.TextColor3=THEME.DIM; ver.TextXAlignment=Enum.TextXAlignment.Right; ver.ZIndex=2
 
 local drag,sp,spos
@@ -260,15 +312,13 @@ UIS.InputChanged:Connect(function(i)
     end
 end)
 
--- status
 local status=Instance.new("TextLabel",root)
 status.Size=UDim2.new(1,-24,0,28); status.Position=UDim2.fromOffset(12,58)
 status.BackgroundColor3=THEME.SURF; status.BorderSizePixel=0; corner(status,8); stroke(status,THEME.STROKE,1,0.5)
-status.Font=Enum.Font.GothamBold; status.Text="IDLE — WAITING FOR TRADE"; status.TextSize=11; status.TextColor3=THEME.DIM
+status.Font=Enum.Font.GothamBold; status.Text="IDLE"; status.TextSize=11; status.TextColor3=THEME.DIM
 status.TextXAlignment=Enum.TextXAlignment.Left; status.ZIndex=2
 Instance.new("UIPadding",status).PaddingLeft=UDim.new(0,10)
 
--- toggles
 local function toggleRow(y,label,key)
     local b=Instance.new("TextButton",root)
     b.Size=UDim2.new(1,-24,0,32); b.Position=UDim2.fromOffset(12,y)
@@ -292,7 +342,6 @@ end
 toggleRow(94,"Auto-accept fair trades","autoAccept")
 toggleRow(130,"Auto chat negotiation","autoChat")
 
--- buy targets section
 local listLabel=Instance.new("TextLabel",root)
 listLabel.Size=UDim2.new(1,-24,0,16); listLabel.Position=UDim2.fromOffset(12,172)
 listLabel.BackgroundTransparency=1; listLabel.Font=Enum.Font.GothamBlack; listLabel.Text="BUY TARGETS"
@@ -327,7 +376,6 @@ local function renderTargets()
     end
 end
 
--- add target row
 local input=Instance.new("TextBox",root)
 input.Size=UDim2.new(1,-96,0,30); input.Position=UDim2.fromOffset(12,346)
 input.BackgroundColor3=THEME.SURF; input.BorderSizePixel=0; input.PlaceholderText="brainrot name..."
@@ -342,7 +390,7 @@ addBtn.MouseButton1Click:Connect(function()
     local t=input.Text; if t=="" then return end
     if not V[t] then
         status.Text="UNKNOWN: "..t; status.TextColor3=THEME.DANGER
-        task.delay(2,function() if status.Parent then status.Text="IDLE — WAITING FOR TRADE"; status.TextColor3=THEME.DIM end end)
+        task.delay(2,function() if status.Parent then status.Text="IDLE"; status.TextColor3=THEME.DIM end end)
         return
     end
     for _,n in ipairs(targets) do if n==t then input.Text=""; return end end
@@ -350,7 +398,6 @@ addBtn.MouseButton1Click:Connect(function()
     status.Text="ADDED: "..t; status.TextColor3=THEME.SUCCESS
 end)
 
--- set value row
 local vLabel=Instance.new("TextLabel",root)
 vLabel.Size=UDim2.new(1,-24,0,16); vLabel.Position=UDim2.fromOffset(12,384)
 vLabel.BackgroundTransparency=1; vLabel.Font=Enum.Font.GothamBlack; vLabel.Text="SET VALUE"
@@ -381,16 +428,15 @@ setBtn.MouseButton1Click:Connect(function()
     local n=vInput.Text; local num=tonumber(nInput.Text)
     if n=="" or not num then
         status.Text="NEED NAME + NUMBER"; status.TextColor3=THEME.DANGER
-        task.delay(2,function() if status.Parent then status.Text="IDLE — WAITING FOR TRADE"; status.TextColor3=THEME.DIM end end)
+        task.delay(2,function() if status.Parent then status.Text="IDLE"; status.TextColor3=THEME.DIM end end)
         return
     end
     V[n]=num; vInput.Text=""; nInput.Text=""; renderTargets()
     status.Text=("SET: %s = %dG"):format(n,num); status.TextColor3=THEME.SUCCESS
 end)
 
--- readout
 local readout=Instance.new("TextLabel",root)
-readout.Size=UDim2.new(1,-24,0,50); readout.Position=UDim2.fromOffset(12,448)
+readout.Size=UDim2.new(1,-24,0,56); readout.Position=UDim2.fromOffset(12,448)
 readout.BackgroundColor3=THEME.SURF2; readout.BorderSizePixel=0
 readout.Font=Enum.Font.Gotham; readout.TextSize=10; readout.TextColor3=THEME.DIM
 readout.TextWrapped=true; readout.TextXAlignment=Enum.TextXAlignment.Left
@@ -398,34 +444,51 @@ readout.Text="open a trade — values shown here"; readout.ZIndex=2
 corner(readout,8); stroke(readout,THEME.STROKE,1,0.6)
 local rpad=Instance.new("UIPadding",readout); rpad.PaddingLeft=UDim.new(0,10); rpad.PaddingTop=UDim.new(0,6); rpad.PaddingRight=UDim.new(0,6)
 
--- footer
 local footer=Instance.new("TextLabel",root)
 footer.AnchorPoint=Vector2.new(0.5,1); footer.Position=UDim2.new(0.5,0,1,-8); footer.Size=UDim2.new(1,-24,0,14)
 footer.BackgroundTransparency=1; footer.Font=Enum.Font.GothamBlack; footer.Text="GUEST · AUTO TRADER"
 footer.TextSize=11; footer.TextColor3=THEME.DIM; footer.ZIndex=3
 
--- ============ LOOPS ============
-local accepted={}
+-- ============ ACCEPT LOOP (rewritten) ============
+-- Runs whenever a trade window exists. Does NOT depend on partner name.
+-- Debounce is per (partner, myValue, theirValue) signature so re-reads don't re-fire.
+local lastAcceptedSig=nil
+local lastAcceptAt=0
 task.spawn(function()
     while gui.Parent do
         pcall(function()
-            local p=getPartnerName()
-            if not p then
-                if status.Text:find("WAITING") then else status.Text="IDLE — WAITING FOR TRADE"; status.TextColor3=THEME.DIM end
+            if not tradeOpen() then
+                if not status.Text:find("ACCEPT") then
+                    status.Text="IDLE"; status.TextColor3=THEME.DIM
+                end
+                readout.Text="open a trade — values shown here"
                 return
             end
-            local my=readSide("me"); local th=readSide("them")
-            local mv=listValue(my); local tv=listValue(th)
-            readout.Text=("PARTNER: %s\nMY: %dG (%d) | THEIRS: %dG (%d)\nMARGIN: %+dG | ROUNDS: %d"):format(p,mv,#my,tv,#th,tv-mv,NEGO.rounds)
-            if POLICY.autoAccept and (tv-mv)>=POLICY.minMargin and not accepted[p] then
-                local b=findBtn({"accept","confirm"})
-                if b then
-                    accepted[p]=true; task.wait(0.35); press(b); say("deal, thanks")
-                    status.Text="ACCEPTED: "..p; status.TextColor3=THEME.SUCCESS
-                end
+            local my,their=getTradeRoot() and readAll() or {},{}
+            local mv=listValue(my); local tv=listValue(their)
+            local p=getPartnerName() or "?"
+            readout.Text=("PARTNER: %s\nMY: %dG (%d) | THEIRS: %dG (%d)\nMARGIN: %+dG | ROUNDS: %d"):format(p,mv,#my,tv,#th or 0,tv-mv,NEGO.rounds)
+            if not POLICY.autoAccept then return end
+            if #their==0 then
+                status.Text="TRADE OPEN — THEIR SIDE EMPTY"; status.TextColor3=THEME.DIM
+                return
+            end
+            if (tv-mv) < POLICY.minMargin then
+                status.Text=("WAITING — MARGIN %+dG"):format(tv-mv); status.TextColor3=THEME.DIM
+                return
+            end
+            local sig=("%s|%d|%d"):format(p,mv,tv)
+            if sig==lastAcceptedSig and (os.clock()-lastAcceptAt)<4 then return end
+            local b=findBtn({"accept","confirm"})
+            if b then
+                lastAcceptedSig=sig; lastAcceptAt=os.clock()
+                task.wait(0.35); press(b); say("deal, thanks")
+                status.Text="ACCEPTED: "..p; status.TextColor3=THEME.SUCCESS
+            else
+                status.Text="FAIR TRADE — ACCEPT BTN NOT FOUND"; status.TextColor3=THEME.DANGER
             end
         end)
-        task.wait(0.5)
+        task.wait(0.4)
     end
 end)
 
