@@ -1,0 +1,473 @@
+-- GuestAutoTrader.lua v1.3.0  — self-contained, on-screen UI, no console needed
+-- Brand: GUEST AUTO TRADER  |  Style: GuestConvincer v4.1.0 theme
+local ENV=(type(getgenv)=="function" and getgenv()) or _G
+if ENV.__GuestAutoTraderV13 then pcall(function() ENV.__GuestAutoTraderV13.gui:Destroy() end) end
+
+local Players=game:GetService("Players")
+local RS=game:GetService("ReplicatedStorage")
+local HS=game:GetService("HttpService")
+local TS=game:GetService("TweenService")
+local UIS=game:GetService("UserInputService")
+local LP=Players.LocalPlayer
+local HTTP=(syn and syn.request) or http_request or request
+local gethui_=gethui or function() return game:GetService("CoreGui") end
+
+-- ============ THEME (GuestConvincer) ============
+local THEME={
+    BG=Color3.fromRGB(10,12,20), SURF=Color3.fromRGB(18,21,32), SURF2=Color3.fromRGB(26,30,44),
+    TEXT=Color3.fromRGB(226,232,240), DIM=Color3.fromRGB(148,163,184),
+    ACCENT=Color3.fromRGB(99,102,241), ACCENT2=Color3.fromRGB(79,70,229), STROKE=Color3.fromRGB(71,85,105),
+    GREEN1=Color3.fromRGB(22,101,52), GREEN_STROKE=Color3.fromRGB(74,222,128),
+    DANGER=Color3.fromRGB(239,68,68), SUCCESS=Color3.fromRGB(34,197,94),
+}
+
+-- ============ VALUES ============
+local V={
+    ["Garama and Madundung"]=1,
+    ["Dragon Cannelloni"]=22,
+    ["Hydra Dragon Cannelloni"]=26,
+    ["Hydra Serpent"]=12,
+    ["Sammyni Truckini"]=5,
+    ["Sammyni Fattini"]=3,
+    ["Capitano Moby"]=2,
+    ["Cerberus"]=3,
+}
+local MUT_MULT={["None"]=1.0,["Cyber"]=5.0,["Divine"]=5.0,["Phantom"]=5.0,["Crystal"]=5.0,["Eclipse"]=5.0,["Candy"]=2.0,["Radioactive"]=4.0,["Lava"]=4.0,["Galaxy"]=4.0,["Yin Yang"]=4.0,["Cursed"]=4.0}
+local MUT_ALIAS={["YinYang"]="Yin Yang",["Yin-Yang"]="Yin Yang"}
+local POLICY={minMargin=0,askMarkup=0.10,askCap=2,offerShave=0.10,offerFloor=2,autoAccept=true,autoChat=true}
+
+local function mutOf(r) if not r or r=="" or r=="None" then return "None" end return MUT_ALIAS[r] or r end
+local function itemValue(e) if type(e)~="table" then return 0 end local b=V[e.Index]; if not b then return 0 end return b*(MUT_MULT[mutOf(e.Mutation)] or 1.0) end
+local function listValue(l) local t=0 if type(l)~="table" then return 0 end for _,e in ipairs(l) do t=t+itemValue(e) end return t end
+local function askFor(v) return v+math.min(math.ceil(v*POLICY.askMarkup),POLICY.askCap) end
+local function offerFor(v) return v-math.min(math.ceil(v*POLICY.offerShave),POLICY.offerFloor) end
+
+-- ============ TRADE ROOT ============
+local function pg() return LP:FindFirstChild("PlayerGui") end
+local function getTradeRoot()
+    local p=pg(); if not p then return nil end
+    local tl=p:FindFirstChild("TradeLiveTrade"); if not tl then return nil end
+    return tl:FindFirstChild("TradeLiveTrade") or tl
+end
+local function getPartnerName()
+    local t=getTradeRoot(); if not t then return nil end
+    local o=t:FindFirstChild("Other"); if not o then return nil end
+    local u=o:FindFirstChild("Username")
+    if u and u:IsA("TextLabel") then return (u.Text:match("@([%w_]+)") or u.Text) end
+    return nil
+end
+
+local function readSide(which)
+    local t=getTradeRoot(); if not t then return {} end
+    local names=which=="me" and {"YourItems","MyItems","YourOffer","MyOffer"} or {"TheirItems","TheirOffer"}
+    local side
+    for _,n in ipairs(names) do side=t:FindFirstChild(n,true); if side then break end end
+    if not side then
+        for _,d in ipairs(t:GetDescendants()) do
+            if d:IsA("GuiObject") then
+                for _,l in ipairs(d:GetDescendants()) do
+                    if l:IsA("TextLabel") and V[l.Text] then side=d; break end
+                end
+                if side then break end
+            end
+        end
+    end
+    if not side then return {} end
+    local out={}
+    for _,d in ipairs(side:GetDescendants()) do
+        if d:IsA("TextLabel") and V[d.Text] then
+            local mut=nil
+            for _,sib in ipairs(d.Parent:GetChildren()) do
+                if sib:IsA("TextLabel") and sib~=d then local m=mutOf(sib.Text); if MUT_MULT[m] then mut=m; break end end
+            end
+            out[#out+1]={Index=d.Text,Mutation=mut}
+        end
+    end
+    return out
+end
+
+-- ============ SAY / TRANSLATE ============
+local function googleTranslate(text,tl,sl)
+    if type(HTTP)~="function" or not text or text=="" then return text end
+    local ok,res=pcall(function()
+        return HTTP({Url=("https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=%s&tl=%s&q=%s"):format(HS:UrlEncode(sl or "auto"),HS:UrlEncode(tl),HS:UrlEncode(text)),Method="GET",Headers={["User-Agent"]="Mozilla/5.0"}})
+    end)
+    if not ok or type(res)~="table" then return text end
+    local body=res.Body or res.body; if type(body)~="string" then return text end
+    local ok2,d=pcall(function() return HS:JSONDecode(body) end)
+    if ok2 and type(d)=="table" and type(d[1])=="string" then return d[1] end
+    return text
+end
+local function getChatBox()
+    local t=getTradeRoot(); if not t then return nil end
+    local ch=t:FindFirstChild("Chat"); if not ch then return nil end
+    for _,k in ipairs({"NormalChat","RestrictedChat"}) do
+        local c=ch:FindFirstChild(k); local b=c and c:FindFirstChild("ChatBox")
+        b=b and (b:FindFirstChildWhichIsA("TextBox") or b)
+        if b and b:IsA("TextBox") then return b end
+    end
+    for _,d in ipairs(t:GetDescendants()) do if d:IsA("TextBox") and d.Name:lower():find("chat") then return d end end
+    return nil
+end
+local function say(text)
+    if not POLICY.autoChat then return false end
+    local box=getChatBox(); if not box then return false end
+    return (pcall(function()
+        box.Text=googleTranslate(text,"en","auto")
+        if type(firesignal)=="function" then firesignal(box.FocusLost,true,Enum.KeyCode.Return)
+        else box:CaptureFocus(); local vim=game:GetService("VirtualInputManager"); vim:SendKeyEvent(true,Enum.KeyCode.Return,false,game); vim:SendKeyEvent(false,Enum.KeyCode.Return,false,game) end
+    end))
+end
+
+-- ============ BUTTONS ============
+local function findBtn(words)
+    local t=getTradeRoot(); if not t then return nil end
+    for _,d in ipairs(t:GetDescendants()) do
+        if d:IsA("TextButton") or d:IsA("ImageButton") then
+            local s=(d.Text or d.Name or ""):lower()
+            for _,w in ipairs(words) do if s:find(w,1,true) then return d end end
+        end
+    end
+    return nil
+end
+local function press(b)
+    if not b then return false end
+    return (pcall(function()
+        if type(firesignal)=="function" then firesignal(b.MouseButton1Click); firesignal(b.Activated) end
+        if type(firetouch)=="function" then firetouch(b) end
+    end))
+end
+
+-- ============ NEGOTIATION ============
+local NEGO={rounds=0,last=0,partner=nil,opened=0}
+local function resetNego(p) NEGO.rounds=0; NEGO.last=0; NEGO.partner=p end
+local lastReply=""
+local function negotiate(text)
+    if not POLICY.autoChat then return end
+    if NEGO.partner~=getPartnerName() then resetNego(getPartnerName()) end
+    local now=os.clock(); if now-NEGO.last<2 then return end; NEGO.last=now
+    local l=text:lower()
+    if l:find("add") or l:find("more") or l:find("+") then
+        NEGO.rounds=NEGO.rounds+1
+        if NEGO.rounds==1 then say("i cant add, its fair"); lastReply="cant add, its fair"
+        elseif NEGO.rounds==2 then say("its fair bruh i cant add"); lastReply="its fair bruh"
+        else say("no thanks, gl"); lastReply="no thanks" end
+        return
+    end
+    if l:find("no") or l:find("nty") or l:find("nah") or l:find("pass") then say("no thanks"); lastReply="no thanks"; return end
+    for name in pairs(V) do
+        if l:find(name:lower(),1,true) then
+            local my=listValue(readSide("me")); local th=listValue(readSide("them"))
+            if th<NEGO.opened then NEGO.rounds=NEGO.rounds+1; if NEGO.rounds<=2 then say("add"); lastReply="add" else say("its fair, no thanks"); lastReply="fair, no" end
+            else say("ok deal"); lastReply="ok deal" end
+            return
+        end
+    end
+end
+
+-- ============ BUY FLOW ============
+local Sync=(function() local p=RS:FindFirstChild("Packages"); p=p and p:FindFirstChild("Synchronizer"); if p then local ok,r=pcall(require,p); if ok then return r end end end)()
+local function plotOf(ownerName)
+    local plots=workspace:FindFirstChild("Plots"); if not plots or not Sync then return nil end
+    for _,c in ipairs(plots:GetChildren()) do
+        local ok,t=pcall(function() return Sync:GetTableFromChannel(c.Name) end)
+        if ok and type(t)=="table" and t.Owner then
+            local n=typeof(t.Owner)=="Instance" and t.Owner.Name or tostring(t.Owner)
+            if n==ownerName then return c.Name,t end
+        end
+    end
+end
+local function findSeller(name)
+    if not Sync then return nil end
+    local plots=workspace:FindFirstChild("Plots"); if not plots then return end
+    for _,c in ipairs(plots:GetChildren()) do
+        local ok,t=pcall(function() return Sync:GetTableFromChannel(c.Name) end)
+        if ok and type(t)=="table" and type(t.AnimalList)=="table" then
+            local o=typeof(t.Owner)=="Instance" and t.Owner.Name or tostring(t.Owner)
+            if o~=LP.Name then for _,e in ipairs(t.AnimalList) do if e.Index==name then return o,e end end end
+        end
+    end
+end
+local function buyFrom(name)
+    local owner,entry=findSeller(name); if not owner then return false,"seller not found" end
+    local mv=itemValue(entry); local off=offerFor(mv)
+    local pn=plotOf(owner); local plots=workspace:FindFirstChild("Plots")
+    local plot=plots and pn and plots:FindFirstChild(pn); if not plot then return false,"plot missing" end
+    local prompt
+    for _,d in ipairs(plot:GetDescendants()) do if d:IsA("ProximityPrompt") and d.ActionText=="SEND TRADE" then prompt=d; break end end
+    if not prompt then return false,"no prompt" end
+    pcall(function() fireproximityprompt(prompt) end)
+    task.wait(1.0); resetNego(owner); NEGO.opened=mv
+    say(("offering %d garamas, that's fair"):format(math.floor(off)))
+    return true,("offer %d to %s"):format(math.floor(off),owner)
+end
+
+-- ============ UI (GuestConvincer theme) ============
+local function corner(p,r) local c=Instance.new("UICorner",p); c.CornerRadius=UDim.new(0,r or 8); return c end
+local function stroke(p,c,t,tr) local s=Instance.new("UIStroke",p); s.Color=c or THEME.STROKE; s.Thickness=t or 1; s.Transparency=tr or 0.4; return s end
+local function tween(o,d,pr) TS:Create(o,TweenInfo.new(d or 0.14,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),pr):Play() end
+local function shadow(parent)
+    local i=Instance.new("ImageLabel",parent)
+    i.AnchorPoint=Vector2.new(0.5,0.5); i.Position=UDim2.new(0.5,0,0.5,2); i.Size=UDim2.new(1,26,1,26)
+    i.BackgroundTransparency=1; i.Image="rbxassetid://6014261993"; i.ImageColor3=Color3.new(0,0,0)
+    i.ImageTransparency=0.72; i.ScaleType=Enum.ScaleType.Slice; i.SliceCenter=Rect.new(49,49,450,450); i.ZIndex=0; return i
+end
+local function button(parent,text,opts)
+    opts=opts or {}
+    local b=Instance.new("TextButton",parent)
+    b.AutoButtonColor=false; b.BackgroundColor3=opts.color or THEME.ACCENT2; b.BorderSizePixel=0
+    b.Text=text; b.Font=Enum.Font.GothamBold; b.TextSize=opts.textSize or 11; b.TextColor3=THEME.TEXT
+    corner(b,opts.radius or 8); stroke(b,opts.stroke or THEME.ACCENT,1,opts.strokeT or 0.35)
+    b.MouseButton1Down:Connect(function() tween(b,0.08,{BackgroundColor3=opts.press or THEME.ACCENT}) end)
+    b.MouseButton1Up:Connect(function() tween(b,0.14,{BackgroundColor3=opts.color or THEME.ACCENT2}) end)
+    return b
+end
+
+local gui=Instance.new("ScreenGui"); gui.Name="GuestAutoTrader"; gui.ResetOnSpawn=false
+gui.DisplayOrder=999999; gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; gui.IgnoreGuiInset=true; gui.Parent=gethui_()
+
+local root=Instance.new("Frame",gui)
+root.Size=UDim2.fromOffset(360,540); root.Position=UDim2.fromOffset(20,100)
+root.BackgroundColor3=THEME.BG; root.BorderSizePixel=0
+corner(root,16); stroke(root,THEME.STROKE,1.4,0.38); shadow(root)
+local grad=Instance.new("UIGradient",root)
+grad.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(24,27,42)),ColorSequenceKeypoint.new(1,Color3.fromRGB(12,14,22))})
+grad.Rotation=90
+
+-- header
+local header=Instance.new("Frame",root); header.Size=UDim2.new(1,0,0,52); header.BackgroundTransparency=1; header.ZIndex=2
+local accentBar=Instance.new("Frame",header); accentBar.Size=UDim2.fromOffset(8,8); accentBar.Position=UDim2.fromOffset(16,22)
+accentBar.BackgroundColor3=THEME.ACCENT; accentBar.BorderSizePixel=0; corner(accentBar,4); accentBar.ZIndex=2
+local title=Instance.new("TextLabel",header); title.Size=UDim2.new(1,-40,0,26); title.Position=UDim2.fromOffset(32,14)
+title.BackgroundTransparency=1; title.Font=Enum.Font.GothamBlack; title.Text="GUEST AUTO TRADER"; title.TextSize=17
+title.TextColor3=THEME.TEXT; title.TextXAlignment=Enum.TextXAlignment.Left; title.ZIndex=2
+local subLine=Instance.new("Frame",header); subLine.Position=UDim2.fromOffset(32,42); subLine.Size=UDim2.fromOffset(150,2)
+subLine.BackgroundColor3=THEME.ACCENT; subLine.BorderSizePixel=0; corner(subLine,1); subLine.ZIndex=2
+local ver=Instance.new("TextLabel",header); ver.Size=UDim2.fromOffset(80,14); ver.Position=UDim2.new(1,-96,0,18)
+ver.BackgroundTransparency=1; ver.Font=Enum.Font.GothamBold; ver.Text="v1.3.0"; ver.TextSize=10
+ver.TextColor3=THEME.DIM; ver.TextXAlignment=Enum.TextXAlignment.Right; ver.ZIndex=2
+
+local drag,sp,spos
+header.InputBegan:Connect(function(i)
+    if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+        drag=true; sp=i.Position; spos=root.Position
+        i.Changed:Connect(function() if i.UserInputState==Enum.UserInputState.End then drag=false end end)
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if drag and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
+        local d=i.Position-sp; root.Position=UDim2.new(spos.X.Scale,spos.X.Offset+d.X,spos.Y.Scale,spos.Y.Offset+d.Y)
+    end
+end)
+
+-- status
+local status=Instance.new("TextLabel",root)
+status.Size=UDim2.new(1,-24,0,28); status.Position=UDim2.fromOffset(12,58)
+status.BackgroundColor3=THEME.SURF; status.BorderSizePixel=0; corner(status,8); stroke(status,THEME.STROKE,1,0.5)
+status.Font=Enum.Font.GothamBold; status.Text="IDLE — WAITING FOR TRADE"; status.TextSize=11; status.TextColor3=THEME.DIM
+status.TextXAlignment=Enum.TextXAlignment.Left; status.ZIndex=2
+Instance.new("UIPadding",status).PaddingLeft=UDim.new(0,10)
+
+-- toggles
+local function toggleRow(y,label,key)
+    local b=Instance.new("TextButton",root)
+    b.Size=UDim2.new(1,-24,0,32); b.Position=UDim2.fromOffset(12,y)
+    b.AutoButtonColor=false; b.BackgroundColor3=THEME.SURF; b.Text=""; b.ZIndex=2
+    corner(b,8); stroke(b,THEME.STROKE,1,0.55)
+    local t=Instance.new("TextLabel",b); t.Size=UDim2.new(1,-64,1,0); t.Position=UDim2.fromOffset(12,0)
+    t.BackgroundTransparency=1; t.Text=label; t.Font=Enum.Font.GothamMedium; t.TextSize=12
+    t.TextColor3=THEME.TEXT; t.TextXAlignment=Enum.TextXAlignment.Left; t.ZIndex=3
+    local pill=Instance.new("Frame",b); pill.Size=UDim2.fromOffset(40,20); pill.Position=UDim2.new(1,-50,0.5,-10)
+    pill.BorderSizePixel=0; corner(pill,10); pill.ZIndex=3
+    pill.BackgroundColor3=POLICY[key] and THEME.GREEN1 or THEME.SURF2
+    local knob=Instance.new("Frame",pill); knob.Size=UDim2.fromOffset(14,14); knob.BorderSizePixel=0; corner(knob,7); knob.ZIndex=4
+    knob.BackgroundColor3=POLICY[key] and THEME.GREEN_STROKE or THEME.DIM
+    knob.Position=POLICY[key] and UDim2.new(1,-17,0.5,-7) or UDim2.new(0,3,0.5,-7)
+    b.MouseButton1Click:Connect(function()
+        POLICY[key]=not POLICY[key]
+        tween(pill,0.12,{BackgroundColor3=POLICY[key] and THEME.GREEN1 or THEME.SURF2})
+        tween(knob,0.15,{Position=POLICY[key] and UDim2.new(1,-17,0.5,-7) or UDim2.new(0,3,0.5,-7),BackgroundColor3=POLICY[key] and THEME.GREEN_STROKE or THEME.DIM})
+    end)
+end
+toggleRow(94,"Auto-accept fair trades","autoAccept")
+toggleRow(130,"Auto chat negotiation","autoChat")
+
+-- buy targets section
+local listLabel=Instance.new("TextLabel",root)
+listLabel.Size=UDim2.new(1,-24,0,16); listLabel.Position=UDim2.fromOffset(12,172)
+listLabel.BackgroundTransparency=1; listLabel.Font=Enum.Font.GothamBlack; listLabel.Text="BUY TARGETS"
+listLabel.TextSize=11; listLabel.TextColor3=THEME.ACCENT; listLabel.TextXAlignment=Enum.TextXAlignment.Left; listLabel.ZIndex=2
+local listLine=Instance.new("Frame",root); listLine.Size=UDim2.new(1,-24,0,1); listLine.Position=UDim2.fromOffset(12,190)
+listLine.BackgroundColor3=THEME.STROKE; listLine.BackgroundTransparency=0.6; listLine.BorderSizePixel=0; listLine.ZIndex=2
+
+local scroll=Instance.new("ScrollingFrame",root)
+scroll.Size=UDim2.new(1,-24,0,140); scroll.Position=UDim2.fromOffset(12,198)
+scroll.BackgroundColor3=THEME.SURF; scroll.BorderSizePixel=0; scroll.ScrollBarThickness=4
+scroll.ScrollBarImageColor3=THEME.ACCENT; scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y
+scroll.ZIndex=2; corner(scroll,9); stroke(scroll,THEME.STROKE,1,0.55)
+local sl=Instance.new("UIListLayout",scroll); sl.Padding=UDim.new(0,5)
+local spad=Instance.new("UIPadding",scroll); spad.PaddingTop=UDim.new(0,6); spad.PaddingLeft=UDim.new(0,6); spad.PaddingRight=UDim.new(0,6); spad.PaddingBottom=UDim.new(0,6)
+
+local targets={}
+local function renderTargets()
+    for _,ch in ipairs(scroll:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
+    for i,name in ipairs(targets) do
+        local row=Instance.new("Frame",scroll); row.Size=UDim2.new(1,-4,0,34); row.BackgroundColor3=THEME.SURF2
+        row.BorderSizePixel=0; row.LayoutOrder=i; corner(row,8); stroke(row,THEME.STROKE,1,0.7)
+        local t=Instance.new("TextLabel",row); t.Size=UDim2.new(1,-80,1,0); t.Position=UDim2.fromOffset(10,0)
+        t.BackgroundTransparency=1; t.Text=name; t.Font=Enum.Font.GothamBold; t.TextSize=12
+        t.TextColor3=THEME.TEXT; t.TextXAlignment=Enum.TextXAlignment.Left; t.TextTruncate=Enum.TextTruncate.AtEnd
+        local v=Instance.new("TextLabel",row); v.Size=UDim2.fromOffset(46,34); v.Position=UDim2.new(1,-78,0,0)
+        v.BackgroundTransparency=1; v.Text=tostring(V[name] or "?").."G"; v.Font=Enum.Font.GothamBlack; v.TextSize=11
+        v.TextColor3=THEME.GREEN_STROKE; v.TextXAlignment=Enum.TextXAlignment.Center
+        local del=Instance.new("TextButton",row); del.Size=UDim2.fromOffset(22,22); del.Position=UDim2.new(1,-28,0.5,-11)
+        del.AutoButtonColor=false; del.BackgroundColor3=Color3.fromRGB(90,28,28); del.Text="x"
+        del.Font=Enum.Font.GothamBold; del.TextSize=12; del.TextColor3=THEME.TEXT; corner(del,6)
+        del.MouseButton1Click:Connect(function() table.remove(targets,i); renderTargets() end)
+    end
+end
+
+-- add target row
+local input=Instance.new("TextBox",root)
+input.Size=UDim2.new(1,-96,0,30); input.Position=UDim2.fromOffset(12,346)
+input.BackgroundColor3=THEME.SURF; input.BorderSizePixel=0; input.PlaceholderText="brainrot name..."
+input.PlaceholderColor3=THEME.DIM; input.Font=Enum.Font.GothamMedium; input.TextSize=12
+input.TextColor3=THEME.TEXT; input.Text=""; input.ClearTextOnFocus=false; input.ZIndex=3
+input.TextXAlignment=Enum.TextXAlignment.Left; corner(input,9); stroke(input,THEME.STROKE,1,0.5)
+Instance.new("UIPadding",input).PaddingLeft=UDim.new(0,10)
+
+local addBtn=button(root,"+ ADD",{textSize=11})
+addBtn.Size=UDim2.fromOffset(80,30); addBtn.Position=UDim2.new(1,-92,0,346); addBtn.ZIndex=3
+addBtn.MouseButton1Click:Connect(function()
+    local t=input.Text; if t=="" then return end
+    if not V[t] then
+        status.Text="UNKNOWN: "..t; status.TextColor3=THEME.DANGER
+        task.delay(2,function() if status.Parent then status.Text="IDLE — WAITING FOR TRADE"; status.TextColor3=THEME.DIM end end)
+        return
+    end
+    for _,n in ipairs(targets) do if n==t then input.Text=""; return end end
+    table.insert(targets,t); input.Text=""; renderTargets()
+    status.Text="ADDED: "..t; status.TextColor3=THEME.SUCCESS
+end)
+
+-- set value row
+local vLabel=Instance.new("TextLabel",root)
+vLabel.Size=UDim2.new(1,-24,0,16); vLabel.Position=UDim2.fromOffset(12,384)
+vLabel.BackgroundTransparency=1; vLabel.Font=Enum.Font.GothamBlack; vLabel.Text="SET VALUE"
+vLabel.TextSize=11; vLabel.TextColor3=THEME.ACCENT; vLabel.TextXAlignment=Enum.TextXAlignment.Left; vLabel.ZIndex=2
+local vLine=Instance.new("Frame",root); vLine.Size=UDim2.new(1,-24,0,1); vLine.Position=UDim2.fromOffset(12,402)
+vLine.BackgroundColor3=THEME.STROKE; vLine.BackgroundTransparency=0.6; vLine.BorderSizePixel=0; vLine.ZIndex=2
+
+local vInput=Instance.new("TextBox",root)
+vInput.Size=UDim2.new(0,140,0,30); vInput.Position=UDim2.fromOffset(12,410)
+vInput.BackgroundColor3=THEME.SURF; vInput.BorderSizePixel=0
+vInput.PlaceholderText="name"; vInput.PlaceholderColor3=THEME.DIM
+vInput.Font=Enum.Font.GothamMedium; vInput.TextSize=11; vInput.TextColor3=THEME.TEXT
+vInput.Text=""; vInput.ClearTextOnFocus=false; vInput.ZIndex=3
+vInput.TextXAlignment=Enum.TextXAlignment.Left; corner(vInput,9); stroke(vInput,THEME.STROKE,1,0.5)
+Instance.new("UIPadding",vInput).PaddingLeft=UDim.new(0,10)
+
+local nInput=Instance.new("TextBox",root)
+nInput.Size=UDim2.new(0,60,0,30); nInput.Position=UDim2.fromOffset(158,410)
+nInput.BackgroundColor3=THEME.SURF; nInput.BorderSizePixel=0
+nInput.PlaceholderText="val"; nInput.PlaceholderColor3=THEME.DIM
+nInput.Font=Enum.Font.GothamMedium; nInput.TextSize=11; nInput.TextColor3=THEME.TEXT
+nInput.Text=""; nInput.ClearTextOnFocus=false; nInput.ZIndex=3
+nInput.TextXAlignment=Enum.TextXAlignment.Center; corner(nInput,9); stroke(nInput,THEME.STROKE,1,0.5)
+
+local setBtn=button(root,"SET",{color=THEME.SURF2,press=THEME.ACCENT2,stroke=THEME.STROKE,strokeT=0.5,textSize=11})
+setBtn.Size=UDim2.fromOffset(120,30); setBtn.Position=UDim2.new(1,-132,0,410); setBtn.ZIndex=3
+setBtn.MouseButton1Click:Connect(function()
+    local n=vInput.Text; local num=tonumber(nInput.Text)
+    if n=="" or not num then
+        status.Text="NEED NAME + NUMBER"; status.TextColor3=THEME.DANGER
+        task.delay(2,function() if status.Parent then status.Text="IDLE — WAITING FOR TRADE"; status.TextColor3=THEME.DIM end end)
+        return
+    end
+    V[n]=num; vInput.Text=""; nInput.Text=""; renderTargets()
+    status.Text=("SET: %s = %dG"):format(n,num); status.TextColor3=THEME.SUCCESS
+end)
+
+-- readout
+local readout=Instance.new("TextLabel",root)
+readout.Size=UDim2.new(1,-24,0,50); readout.Position=UDim2.fromOffset(12,448)
+readout.BackgroundColor3=THEME.SURF2; readout.BorderSizePixel=0
+readout.Font=Enum.Font.Gotham; readout.TextSize=10; readout.TextColor3=THEME.DIM
+readout.TextWrapped=true; readout.TextXAlignment=Enum.TextXAlignment.Left
+readout.Text="open a trade — values shown here"; readout.ZIndex=2
+corner(readout,8); stroke(readout,THEME.STROKE,1,0.6)
+local rpad=Instance.new("UIPadding",readout); rpad.PaddingLeft=UDim.new(0,10); rpad.PaddingTop=UDim.new(0,6); rpad.PaddingRight=UDim.new(0,6)
+
+-- footer
+local footer=Instance.new("TextLabel",root)
+footer.AnchorPoint=Vector2.new(0.5,1); footer.Position=UDim2.new(0.5,0,1,-8); footer.Size=UDim2.new(1,-24,0,14)
+footer.BackgroundTransparency=1; footer.Font=Enum.Font.GothamBlack; footer.Text="GUEST · AUTO TRADER"
+footer.TextSize=11; footer.TextColor3=THEME.DIM; footer.ZIndex=3
+
+-- ============ LOOPS ============
+local accepted={}
+task.spawn(function()
+    while gui.Parent do
+        pcall(function()
+            local p=getPartnerName()
+            if not p then
+                if status.Text:find("WAITING") then else status.Text="IDLE — WAITING FOR TRADE"; status.TextColor3=THEME.DIM end
+                return
+            end
+            local my=readSide("me"); local th=readSide("them")
+            local mv=listValue(my); local tv=listValue(th)
+            readout.Text=("PARTNER: %s\nMY: %dG (%d) | THEIRS: %dG (%d)\nMARGIN: %+dG | ROUNDS: %d"):format(p,mv,#my,tv,#th,tv-mv,NEGO.rounds)
+            if POLICY.autoAccept and (tv-mv)>=POLICY.minMargin and not accepted[p] then
+                local b=findBtn({"accept","confirm"})
+                if b then
+                    accepted[p]=true; task.wait(0.35); press(b); say("deal, thanks")
+                    status.Text="ACCEPTED: "..p; status.TextColor3=THEME.SUCCESS
+                end
+            end
+        end)
+        task.wait(0.5)
+    end
+end)
+
+task.spawn(function()
+    while gui.Parent do
+        if #targets>0 then
+            for i=#targets,1,-1 do
+                local ok,msg=buyFrom(targets[i])
+                if ok then status.Text=msg; status.TextColor3=THEME.ACCENT; table.remove(targets,i); renderTargets(); task.wait(4)
+                else status.Text=(targets[i]..": "..tostring(msg)); status.TextColor3=THEME.DIM; task.wait(2) end
+            end
+        end
+        task.wait(3)
+    end
+end)
+
+local function attachChat()
+    local t=getTradeRoot(); if not t then return end
+    local ch=t:FindFirstChild("Chat"); if not ch then return end
+    for _,k in ipairs({"NormalChat","RestrictedChat"}) do
+        local c=ch:FindFirstChild(k); if not c then continue end
+        local sf=c:FindFirstChild("ScrollingFrame"); if not sf then continue end
+        sf.ChildAdded:Connect(function(child)
+            task.defer(function()
+                task.wait(0.15)
+                local lbl=child:FindFirstChild("Label",true); if not lbl or type(lbl.Text)~="string" then return end
+                local pi=child:FindFirstChild("PlayerImage"); pi=pi and pi:FindFirstChild("Headshot")
+                if pi and type(pi.Image)=="string" then local m=pi.Image:match("id=(%d+)"); if m and tonumber(m)==LP.UserId then return end end
+                negotiate(lbl.Text)
+                if lastReply~="" then status.Text="REPLIED: "..lastReply; status.TextColor3=THEME.ACCENT end
+            end)
+        end)
+    end
+end
+task.spawn(function()
+    while gui.Parent do
+        if getTradeRoot() then pcall(attachChat); break end
+        task.wait(1)
+    end
+end)
+
+renderTargets()
+
+ENV.__GuestAutoTraderV13={gui=gui,values=V,policy=POLICY,targets=targets}
+return ENV.__GuestAutoTraderV13
