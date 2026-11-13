@@ -1,4 +1,4 @@
--- GuestAutoTrader.lua v2.0.2 — v2.0.1 + VIM notification click restored
+-- GuestAutoTrader.lua v2.0.3 — no VIM, notification via mouse1click / mouse press-release / firesignal
 local ENV=(type(getgenv)=="function" and getgenv()) or _G
 if ENV.__GuestAutoTraderV20 then pcall(function() ENV.__GuestAutoTraderV20.gui:Destroy() end) end
 
@@ -6,7 +6,6 @@ local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
 local TS=game:GetService("TweenService")
 local UIS=game:GetService("UserInputService")
-local VIM=game:GetService("VirtualInputManager")
 local LP=Players.LocalPlayer
 local gethui_=gethui or function() return game:GetService("CoreGui") end
 
@@ -47,10 +46,7 @@ end
 local Sync
 do
     local pk=RS:FindFirstChild("Packages")
-    if pk then
-        local sc=pk:FindFirstChild("Synchronizer")
-        if sc then local ok,res=pcall(require,sc); Sync=ok and res or nil; log("require(Synchronizer) ok="..tostring(ok)) end
-    end
+    if pk then local sc=pk:FindFirstChild("Synchronizer"); if sc then local ok,res=pcall(require,sc); Sync=ok and res or nil end end
 end
 
 local function plotOf(ownerName)
@@ -116,10 +112,9 @@ end
 local function readMySide() return readSideCards("Your") end
 local function readTheirSide() return readSideCards("Other") end
 
--- ===== CLICK =====
--- firesignal only, no VIM (for Ready, chat send, in-trade clicks)
+-- ===== CLICK (multiple paths, no VIM) =====
 local function fireClick(btn)
-    if not btn then return false end
+    if not btn then return false,"no btn" end
     local fired=false
     pcall(function()
         if firesignal then
@@ -127,20 +122,49 @@ local function fireClick(btn)
             pcall(function() firesignal(btn.MouseButton1Click); fired=true end)
         end
     end)
-    return fired
+    return fired and "firesignal" or "none"
 end
--- VIM click (notification Yes only)
-local function vimClick(btn)
-    if not btn then return false end
-    local ok=false
-    pcall(function()
-        local pos=btn.AbsolutePosition+btn.AbsoluteSize/2
-        VIM:SendMouseButtonEvent(pos.X,pos.Y,0,true,game,1)
-        VIM:SendMouseButtonEvent(pos.X,pos.Y,0,false,game,1)
-        ok=true
-    end)
-    return ok
+
+-- Notification click without VIM: mouse1click / mouse split / firesignal fallback
+local function mouseClickAt(absX, absY)
+    -- path 1: single-call mouse1click with absolute screen position
+    if type(mouse1click)=="function" then
+        local moved=false
+        if type(mousemoverel)=="function" then
+            -- some executors require a relative move first
+            pcall(function() mousemoverel(0,0) end)
+        end
+        local ok=pcall(function() mouse1click() end)
+        if ok then return "mouse1click" end
+    end
+    -- path 2: split press/release + absolute move
+    if type(mousemoveabs)=="function" and type(mouse1press)=="function" and type(mouse1release)=="function" then
+        local ok=pcall(function()
+            mousemoveabs(absX,absY)
+            task.wait(0.03)
+            mouse1press()
+            task.wait(0.04)
+            mouse1release()
+        end)
+        if ok then return "mouse press/release" end
+    end
+    return "no mouse API"
 end
+
+local function notifyClick(btn)
+    if not btn then return false,"no btn" end
+    -- firesignal first (harmless, in case this button listens to it)
+    local fr=fireClick(btn)
+    -- then mouse API (position-based)
+    local ap=btn.AbsolutePosition
+    local asz=btn.AbsoluteSize
+    local cx=ap.X+asz.X/2
+    local cy=ap.Y+asz.Y/2
+    local mres=mouseClickAt(cx,cy)
+    log("notif: firesignal="..fr.." mouse="..mres.." at ("..math.floor(cx)..","..math.floor(cy)..")")
+    return true,("firesignal+"..mres)
+end
+
 local function fireReturnIn(box)
     if not box or not box:IsA("TextBox") then return false end
     local ok=false
@@ -170,7 +194,7 @@ local function say(text)
     return ok
 end
 
--- ===== READY (firesignal, lockout) =====
+-- ===== READY =====
 local readyLock={}
 local function fireReadyOnce()
     local t=getTradeRoot(); if not t then return false,"no trade" end
@@ -186,23 +210,21 @@ local function fireReadyOnce()
     return true,"fired"
 end
 
--- ===== NOTIFICATION HOOK with VIM click =====
+-- ===== NOTIFICATION HOOK =====
 task.spawn(function()
-    local p=pg(); if not p then log("notif: no PlayerGui"); return end
+    local p=pg(); if not p then return end
     local tp=p:FindFirstChild("TradePrompts")
-    if not tp then log("notif: waiting for TradePrompts"); tp=p:WaitForChild("TradePrompts",60) end
+    if not tp then tp=p:WaitForChild("TradePrompts",60) end
     if not tp then log("notif: TradePrompts NEVER appeared"); return end
-    log("notif: TradePrompts found")
+    log("notif: TradePrompts found; mouse1click="..type(mouse1click).." mousemoveabs="..type(mousemoveabs))
     local function tryAcceptPrompt(prompt)
         local lbl=prompt:FindFirstChild("Label")
         if not lbl or lbl.Text~="Trade Request" then return end
         local yes=prompt:FindFirstChild("Yes"); if not yes then log("notif: no Yes"); return end
         local tb=yes:IsA("TextButton") and yes or yes:FindFirstChildWhichIsA("TextButton")
         if not tb then log("notif: no TextButton under Yes"); return end
-        -- delay so layout position settles
-        task.wait(0.15)
-        local clicked=vimClick(tb)
-        log("notif: VIM click="..tostring(clicked).." at Yes.AbsolutePosition")
+        task.wait(0.2)
+        notifyClick(tb)
     end
     for _,child in ipairs(tp:GetChildren()) do tryAcceptPrompt(child) end
     tp.ChildAdded:Connect(function(child) task.defer(function() tryAcceptPrompt(child) end) end)
@@ -281,7 +303,7 @@ title.TextColor3=THEME.TEXT; title.TextXAlignment=Enum.TextXAlignment.Left; titl
 local subLine=Instance.new("Frame",header); subLine.Position=UDim2.fromOffset(32,42); subLine.Size=UDim2.fromOffset(150,2)
 subLine.BackgroundColor3=THEME.ACCENT; subLine.BorderSizePixel=0; corner(subLine,1); subLine.ZIndex=2
 local ver=Instance.new("TextLabel",header); ver.Size=UDim2.fromOffset(100,14); ver.Position=UDim2.new(1,-110,0,18)
-ver.BackgroundTransparency=1; ver.Font=Enum.Font.GothamBold; ver.Text="v2.0.2"; ver.TextSize=10
+ver.BackgroundTransparency=1; ver.Font=Enum.Font.GothamBold; ver.Text="v2.0.3"; ver.TextSize=10
 ver.TextColor3=THEME.GREEN_STROKE; ver.TextXAlignment=Enum.TextXAlignment.Right; ver.ZIndex=2
 
 local drag,sp,spos
@@ -321,7 +343,7 @@ local function renderLog()
         local l=Instance.new("TextLabel",logScroll)
         l.Size=UDim2.new(1,-2,0,0); l.AutomaticSize=Enum.AutomaticSize.Y
         l.BackgroundTransparency=1; l.Font=Enum.Font.Code; l.TextSize=9
-        l.TextColor3=(LOG[i]:find("err") or LOG[i]:find("failed") or LOG[i]:find("NEVER")) and THEME.DANGER or THEME.DIM
+        l.TextColor3=(LOG[i]:find("err") or LOG[i]:find("failed") or LOG[i]:find("NEVER") or LOG[i]:find("no mouse")) and THEME.DANGER or THEME.DIM
         l.TextWrapped=true; l.TextXAlignment=Enum.TextXAlignment.Left
         l.Text=LOG[i]; l.LayoutOrder=i
     end
@@ -412,8 +434,9 @@ end)
 local bA=button(root,"TEST NOTIF",{color=THEME.SURF2,press=THEME.ACCENT2,stroke=THEME.STROKE,strokeT=0.5,textSize=10})
 bA.Size=UDim2.new(0.5,-16,0,26); bA.Position=UDim2.fromOffset(12,598); bA.ZIndex=3
 bA.MouseButton1Click:Connect(function()
+    log("TEST mouse1click="..type(mouse1click).." mousemoveabs="..type(mousemoveabs).." mouse1press="..type(mouse1press))
     local p=pg(); local tp=p and p:FindFirstChild("TradePrompts")
-    log("TEST notif: TradePrompts="..tostring(tp~=nil))
+    log("TEST TradePrompts="..tostring(tp~=nil))
     if tp then for _,c in ipairs(tp:GetChildren()) do
         local lbl=c:FindFirstChild("Label"); log("  "..c.Name.." Label="..tostring(lbl and lbl.Text))
     end end
@@ -424,7 +447,7 @@ local bB=button(root,"TEST TRADE",{color=THEME.SURF2,press=THEME.ACCENT2,stroke=
 bB.Size=UDim2.new(0.5,-16,0,26); bB.Position=UDim2.new(0.5,4,0,598); bB.ZIndex=3
 bB.MouseButton1Click:Connect(function()
     local t=getTradeRoot()
-    log("TEST trade: root="..tostring(t~=nil))
+    log("TEST trade root="..tostring(t~=nil))
     if t then
         log("  Your="..tostring(t:FindFirstChild("Your")~=nil).." Other="..tostring(t:FindFirstChild("Other")~=nil))
         local my=readMySide(); local their=readTheirSide()
